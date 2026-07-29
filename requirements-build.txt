@@ -1,1 +1,2 @@
 pyinstaller==6.21.0
+truststore==0.10.4
