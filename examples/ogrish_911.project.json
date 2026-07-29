@@ -1,0 +1,49 @@
+{
+  "version": "1.1.0",
+  "output_dir": "~/Downloads/Ogrish911Research",
+  "targets": [
+    "ogrishforum.com/*",
+    "forum.ogrish.com/*"
+  ],
+  "keywords": [
+    "9/11",
+    "9-11",
+    "September 11",
+    "World Trade Center",
+    "WTC",
+    "Twin Towers",
+    "Ground Zero",
+    "jumper",
+    "jumpers",
+    "falling man",
+    "LOL Superman",
+    "lolsuperman",
+    "skylight.mov",
+    "carport",
+    "glass canopy",
+    "impact footage",
+    "rare footage"
+  ],
+  "from_year": 2001,
+  "to_year": 2010,
+  "from_date": "2001",
+  "to_date": "2010",
+  "cdx_filters": [
+    "statuscode:200"
+  ],
+  "cdx_collapses": [
+    "urlkey"
+  ],
+  "cdx_match_type": "",
+  "cdx_extra_params": [],
+  "workers": 4,
+  "download_scope": "all_text",
+  "minimum_score": 1,
+  "max_file_mb": 25.0,
+  "page_size": 5000,
+  "cdx_delay": 0.8,
+  "download_delay": 0.25,
+  "retries": 6,
+  "max_attempts": 4,
+  "user_agent": "ArchiveScout/1.1 public web archive research client"
+}
