@@ -14,6 +14,7 @@ python -m PyInstaller \
   --clean \
   --windowed \
   --onedir \
+  --collect-all truststore \
   --name "$APP_NAME" \
   --osx-bundle-identifier "org.archivescout.desktop" \
   --target-arch x86_64 \
