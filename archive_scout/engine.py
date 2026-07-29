@@ -10,6 +10,7 @@ import os
 import random
 import re
 import sqlite3
+import ssl
 import tempfile
 import threading
 import time
@@ -24,6 +25,8 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable
+
+import truststore
 
 VERSION = "1.1.0"
 CDX_URL = "https://web.archive.org/cdx/search/cdx"
@@ -196,6 +199,7 @@ class HttpClient:
         self.timeout = timeout
         self.user_agent = user_agent
         self.stop_event = stop_event
+        self.ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
     def get(self, url: str, max_bytes: int, accept: str = "*/*") -> dict:
         headers = {
@@ -209,7 +213,11 @@ class HttpClient:
             self.limiter.wait(self.stop_event)
             request = urllib.request.Request(url, headers=headers)
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=self.timeout,
+                    context=self.ssl_context,
+                ) as response:
                     announced = response.headers.get("Content-Length")
                     if announced and announced.isdigit() and int(announced) > max_bytes:
                         raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
