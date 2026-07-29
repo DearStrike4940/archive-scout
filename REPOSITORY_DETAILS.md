@@ -15,7 +15,7 @@ A resumable macOS interface for Wayback CDX searches, archived-page downloads, a
 ## Suggested website
 
 ```text
-https://github.com/YOUR_GITHUB_USERNAME/archive-scout/releases/latest
+https://github.com/DearStrike4940/archive-scout/releases/latest
 ```
 
 ## Topics
