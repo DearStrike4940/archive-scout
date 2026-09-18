@@ -607,7 +607,7 @@ def _request_paged_count(
             # through the configured independent transports. Hand it back to
             # the operation-wide connection circuit instead of multiplying a
             # DNS/proxy/TLS outage by five more multi-backend passes.
-            if exc.connection_failed:
+            if exc.connection_failed or exc.timed_out:
                 raise
             if attempt >= attempts:
                 raise

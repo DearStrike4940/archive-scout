@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Callable
 
-from ..content import decode_bytes, parse_page
+from ..content import decode_bytes, looks_textual_bytes, parse_page
 from ..events import ProgressEvent, Stopped
 from ..storage import sha256_file
 from ..utils import normalize_search, utc_now
@@ -42,20 +42,7 @@ def load_hitlist(keywords: list[str] | None = None, file_path: str | Path = "") 
 
 
 def _count_matches(automaton: LiteralAutomaton, text: str) -> dict[str, int]:
-    spans: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    for pattern, start, end in automaton.find_matches(text, overlapping=True):
-        spans[pattern].append((start, end))
-    counts: dict[str, int] = {}
-    for pattern, values in spans.items():
-        count = 0
-        last_end = -1
-        for start, end in sorted(values):
-            if start >= last_end:
-                count += 1
-                last_end = end
-        if count:
-            counts[pattern] = count
-    return counts
+    return automaton.count_non_overlapping(text)
 
 
 def _resume_or_create_run(database: sqlite3.Connection, keywords: list[str]) -> tuple[int, int]:
@@ -98,12 +85,11 @@ def search_with_hitlist(
     database.commit()
     total = int(database.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
     indexed_checked = local_checked = unavailable = 0
-    match_captures: set[int] = set()
 
     try:
         while True:
             rows = database.execute(
-                """SELECT c.id,c.original_url,c.timestamp,c.local_path,c.document_id,d.path AS document_path
+                """SELECT c.id,c.original_url,c.timestamp,c.local_path,c.document_id,c.mimetype,c.detected_encoding,d.path AS document_path
                    FROM captures c LEFT JOIN documents d ON d.id=c.document_id
                    WHERE c.id>? ORDER BY c.id LIMIT ?""",
                 (last_id, max(1, int(batch_size))),
@@ -127,10 +113,20 @@ def search_with_hitlist(
 
                 local = str(row["local_path"] or row["document_path"] or "")
                 path = Path(local) if local else None
-                if path and path.is_file():
+                data = None
+                if path:
+                    try:
+                        if path.resolve().is_relative_to(Path(root).resolve()):
+                            data = path.read_bytes()
+                    except OSError:
+                        pass  # Missing/unreadable files are coverage gaps, not false negatives.
+                content_type = str(row["mimetype"] or "")
+                if row["detected_encoding"]:
+                    content_type += "; charset=" + str(row["detected_encoding"])
+                if data is not None and looks_textual_bytes(data[:16384], content_type):
                     local_checked += 1
-                    data = path.read_bytes()
-                    raw = decode_bytes(data, "")
+                    raw = decode_bytes(data, content_type)
+                    del data
                     source_counts = _count_matches(automaton, normalize_search(raw))
                     for pattern, count in source_counts.items():
                         counts_by_pattern[pattern] += count
@@ -153,7 +149,6 @@ def search_with_hitlist(
                     hit_rows.append(
                         (run_id, capture_id, display, ",".join(sorted(fields_by_pattern[pattern])), int(count))
                     )
-                    match_captures.add(capture_id)
 
             with database:
                 if hit_rows:
@@ -191,8 +186,8 @@ def search_with_hitlist(
     except Stopped:
         with database:
             database.execute(
-                "UPDATE quick_search_runs SET status='interrupted',last_capture_id=?,updated_at=? WHERE id=?",
-                (last_id, utc_now(), run_id),
+                    "UPDATE quick_search_runs SET status='interrupted',updated_at=? WHERE id=?",
+                (utc_now(), run_id),
             )
         raise
 

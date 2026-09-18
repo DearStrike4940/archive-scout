@@ -1,3 +1,11 @@
+# Archive Scout 1.0.7.1
+
+Reports now appears between Media and Archive analysis in both workspace modes, with complete file/field controls, scrolling, presets, sorting and output limits. Report visibility no longer erases historical scan evidence. New text captures retain their raw source bytes under `.txt` names; binary signatures and media HTML validation strengthen text/media separation.
+
+This patch also fixes CDX input/request encoding, unbounded completed-page accumulation, long repeated page-count timeouts, inconsistent proxy fallback, invalid Range resumes, Hitlist pause checkpoints, an undefined rate-limit cleanup call and repeated local scan failures. The 10-worker / 0.125-second replay profile remains; local scans follow acquisition.
+
+See [the complete v1.0.7.1 notes](docs/V1.0.7.1.md) for behavior, upgrade instructions and validation limits. Schema remains 8. The notes below describe the older 1.0.7 release; its destructive report-storage policy is superseded by 1.0.7.1.
+
 # Archive Scout 1.0.7
 
 Archive Scout 1.0.7 focuses on the post-1.0.6 performance/reliability issues without replacing the proven acquisition architecture. The v1.0.5-style Timemap and replay pacing remains the baseline, while startup no longer performs potentially heavy project preparation on Tk's Start path. The release also makes follow-up media available to download-only projects and turns report generation into a complete per-file/per-field configuration rather than a fixed export.

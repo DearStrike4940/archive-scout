@@ -52,6 +52,26 @@ def normalize_target(value: str) -> str:
     value = value.strip()
     if not value:
         raise ValueError("target cannot be empty")
+    # Accept a copied, wholly encoded URL without unquoting real path escapes
+    # in ordinary targets (a%2Fb and a/b can identify different archive URLs).
+    for _ in range(3):
+        encoded_scheme = re.match(r"(?i)^https?%(?:25)*3a", value)
+        encoded_host_path = "/" not in value and re.match(r"(?i)^[\w.*-]+(?:\.[\w*-]+)+%(?:25)*2f", value)
+        if not (encoded_scheme or encoded_host_path):
+            break
+        value = urllib.parse.unquote(value)
+    parsed = urllib.parse.urlsplit(value if "://" in value else "https://" + value)
+    if parsed.hostname == "web.archive.org" and parsed.path.rstrip("/") in {
+        "/cdx/search/cdx", "/web/timemap/json", "/web/timemap/cdx",
+    }:
+        # A CDX request is a wrapper around a target, never a site to index.
+        targets = urllib.parse.parse_qs(html.unescape(parsed.query)).get("url", [])
+        if len(targets) != 1 or not targets[0].strip():
+            raise ValueError("CDX request must contain exactly one url parameter; enter the original site/path")
+        nested = targets[0]
+        if "web.archive.org/cdx/search/cdx" in nested or "web.archive.org/web/timemap/" in nested:
+            raise ValueError("Nested CDX requests are not targets; enter the original site/path")
+        return normalize_target(nested)
     value = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", value).lstrip("/")
     if not value:
         raise ValueError("target cannot be empty")
@@ -62,6 +82,16 @@ def normalize_target(value: str) -> str:
     if value.endswith("/"):
         return value + "*"
     return value + "*"
+
+
+def cdx_request_url(endpoint: str, params: Iterable[tuple[str, str]]) -> str:
+    """Encode the *parameter values*, keeping readable CDX path/wildcard syntax.
+
+    Ampersands, plus signs, fragments and existing percent escapes inside a
+    nested target/resume key must still be quoted. Do not unquote the final URL.
+    """
+    query = urllib.parse.urlencode(list(params), doseq=True, safe=":/*,", quote_via=urllib.parse.quote)
+    return endpoint + ("&" if "?" in endpoint else "?") + query
 
 
 def normalize_cdx_date(value: str, end: bool = False) -> str:

@@ -2,13 +2,13 @@
 
 Archive Scout is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine.
 
-Archive Scout 1.0.7 is a reliability, acquisition-throughput, media-workflow, and report-control release. It preserves the v1.0.5-style high-throughput Timemap/replay profile while keeping the later durable-resume safeguards, moves potentially slow startup preparation off the Tk event thread, lets the optional media pipeline run after download-only acquisition, and keeps that secondary media query separate from the primary text CDX query. Reports are now fully configurable by output file and field; report-only derived payloads that no enabled report needs are not stored in SQLite.
+Archive Scout 1.0.7.1 fixes report visibility, unsafe report-data cleanup, text/media classification, CDX request handling and download recovery. New text captures use `.txt` filenames and preserve the original response bytes for complete source and Hitlist searches. Full scans drain acquisition before starting local analysis. Download-only remains the leanest acquisition mode.
 
 ## Downloads
 
-- [Download for Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7/ArchiveScout-Windows-x64.zip)
-- [Download for Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7/ArchiveScout-Linux-x64.zip)
-- [Download for macOS Intel and Apple Silicon](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7/ArchiveScout-macOS-Universal.zip)
+- [Download for Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7.1/ArchiveScout-Windows-x64.zip)
+- [Download for Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7.1/ArchiveScout-Linux-x64.zip)
+- [Download for macOS Intel and Apple Silicon](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7.1/ArchiveScout-macOS-Universal.zip)
 
 ## Core workflow
 
@@ -32,7 +32,21 @@ Archive Scout stores project state in SQLite so long jobs can be stopped and res
 
 ## Report control
 
-Advanced mode includes a **Reports** page where every standard text, index/error, media, and archive-analysis report can be enabled or disabled, and every field/column inside those reports can be selected independently. Disabling report-only enrichment also avoids retaining unnecessary scan payloads: snippets, Interesting Links, keyword-hit detail/field lists, and untouched default review rows are stored only when an enabled report needs them. Core manifest state such as URLs, timestamps, local paths, queue/resume status, and operational errors remains independent of report formatting so disabling a report cannot break Resume, Retry, or Search with Hitlist.
+**Reports** appears between **Media** and **Archive analysis** in both Simple and Advanced workspaces. Choose every standard text-scan, index/error, media and archive-analysis output and its individual fields. Scrollable groups keep controls accessible on smaller screens. Set the minimum score, match order/limit, snippet count/length and links per match; use presets for all reports, matched URLs only or no generated reports. Hitlist, AI and manual export formats remain separate operation outputs.
+
+Report visibility never deletes historical match details or human review state. Full scan detail is retained by default so reports can be regenerated without rescanning. Uncheck **Retain full scan details** for lean future scans that omit enrichment unused by enabled reports; changing that choice later may require a local rescan. Download-only creates no scan enrichment either way. If v1.0.7 already erased details, regenerate them by rescanning the saved captures.
+
+## Text and media
+
+Text includes HTML source, plain text, JSON, XML, JavaScript and legacy CGI/PHP/ASP pages. Newly acquired text goes under `captures/YYYY/MM/` with recognizable URL-derived `.txt` names. The raw bytes are retained: `.txt` does not mean stripped markup or lossy transcoding. Existing capture paths remain usable without renaming or downloading again. Hitlist uses SQLite for URL/path/coverage state and reads the capture files for the actual content.
+
+Known binary captures are excluded from the text queue. Ambiguous metadata is checked against response bytes; familiar image/video/document signatures override an incorrect `text/html` header. SVG remains searchable XML and can also be acquired through the media workflow. Optional images/videos retain their file format in flat `media/images` and `media/videos` directories. HTML error pages are rejected as media. Text acquisition does not automatically download every non-media binary format (PDF/ZIP/executables are not plain text).
+
+## Request preview and connection recovery
+
+The CDX preview now shows the actual first request for the chosen strategy, readable parameters and a **Copy request URL** button. Copied CDX links and wholly encoded target URLs are normalized at input. Ordinary escaped paths are preserved. Query values are quoted once at the request boundary; nested `&`, `+`, `%` and fragment characters still need encoding to retain their meaning.
+
+All HTTP backends now follow the environment/proxy toggle consistently. Automatic fallback survives an optional backend failing to initialize. Range resumes validate their offsets and total length; an invalid/rejected range restarts the affected file once rather than appending corrupt bytes. Rate limits still use the shared pause gate, and TLS verification remains enabled. See [v1.0.7.1 release notes](docs/V1.0.7.1.md) for validation and troubleshooting.
 
 When **Also download media during text and download-only runs** is enabled, the Media-page controls apply to both workflows, including embedded discovery and external hosts. Follow-up media uses one timestamp per media URL (`collapse=urlkey`) by default for the normal `earliest` strategy; that media-only default never changes the primary text query's collapse settings.
 
@@ -163,7 +177,7 @@ Text-capture discovery explicitly recognizes legacy web/page formats including `
 
 Automatic indexing now asks Wayback Timemap for the numbered-page count once, uses `pageSize=9`, and keeps up to ten page requests active behind the shared 0.75-second CDX start limiter. Up to 1,000 pages are queued behind that bounded worker pool so one slow request does not create a small-batch barrier. Each completed page is committed immediately and its row buffer is released.
 
-Archive Scout still keeps the resume-key engine as the recovery path. If Timemap page counting is unavailable, a numbered page repeatedly stalls, or Wayback requires smaller work, completed rows stay in SQLite and the affected range converts to resumable windows instead of restarting the project. Explicit `resume` mode remains available. Direct-media indexing uses the same Timemap-first pipeline.
+Archive Scout keeps the resume-key engine as the recovery path when Timemap page counting is unavailable. A slow count is handed back to window recovery without repeating the same full timeout five times. Once numbered pages are known, successful page checkpoints remain intact and only failed pages are retried; persistent failures pause with the exact pending queue saved. Explicit `resume` mode remains available. Direct-media indexing uses the same Timemap-first pipeline.
 
 ## Automation and bot compatibility
 

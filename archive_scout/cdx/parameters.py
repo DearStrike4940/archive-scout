@@ -76,32 +76,15 @@ def build_cdx_params(
 
 
 def parse_cdx(payload: object) -> tuple[list[dict[str, str]], str | None]:
-    if payload in (None, []):
-        return [], None
-    if isinstance(payload, dict):
-        message = str(payload.get("message") or payload.get("error") or payload)
-        lowered = message.lower()
-        if "no capture" in lowered or "no result" in lowered or "not found" in lowered:
-            return [], None
-        raise RuntimeError(message)
-    if not isinstance(payload, list) or not payload:
+    # The extension/legacy API must enforce the same completeness contract as
+    # the compact hot-path parser; otherwise malformed rows silently vanish.
+    from .client import parse_cdx_rows_payload
+    validated = parse_cdx_rows_payload(payload)
+    if payload == [] or isinstance(payload, dict):
         return [], None
     header = payload[0]
-    if not isinstance(header, list):
-        raise RuntimeError("unexpected CDX response header")
-    body = payload[1:]
-    resume = None
-    if len(body) >= 2 and body[-2] == [] and isinstance(body[-1], list) and len(body[-1]) == 1:
-        resume = str(body[-1][0])
-        body = body[:-2]
-    rows: list[dict[str, str]] = []
-    for item in body:
-        if not item or not isinstance(item, list) or len(item) != len(header):
-            continue
-        row = dict(zip(header, item))
-        if row.get("timestamp") and row.get("original"):
-            rows.append(row)
-    return rows, resume
+    rows = [dict(zip(header, item)) for item in payload[1:1 + len(validated.rows)]]
+    return rows, validated.resume_key
 
 
 def cdx_endpoints(config: ProjectConfig) -> tuple[str, ...]:

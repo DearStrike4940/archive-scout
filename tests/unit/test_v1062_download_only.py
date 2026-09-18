@@ -47,7 +47,7 @@ class _ImmediateDownloadClient:
 
 class V1062DownloadOnlyTests(unittest.TestCase):
     def test_release_defaults_and_presets(self):
-        self.assertEqual(VERSION, "1.0.7")
+        self.assertEqual(VERSION, "1.0.7.1")
         config = ProjectConfig(output_dir=Path("."), targets=[], keywords=[]).normalized()
         self.assertEqual(config.workers, 10)
         self.assertEqual(config.scan_workers, 0)

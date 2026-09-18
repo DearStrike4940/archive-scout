@@ -33,7 +33,9 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
     root.mkdir(parents=True, exist_ok=True)
     path = root / DATABASE_NAME
     version = database_version(path) if path.exists() else None
-    if migrate and path.exists() and not is_modern_database(path):
+    if version is not None and version > SCHEMA_VERSION:
+        raise RuntimeError(f"Project schema {version} is newer than supported schema {SCHEMA_VERSION}; update Archive Scout before opening it")
+    if migrate and path.exists() and version not in {2, 3, 4, 5, 6, 7, SCHEMA_VERSION}:
         from ..projects.migration import migrate_legacy_project
         migrate_legacy_project(root)
         version = database_version(path)
@@ -41,8 +43,8 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
         try:
             from ..projects.backups import create_project_backup
             create_project_backup(root, reason=f"before_schema_{SCHEMA_VERSION}", keep=5)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError("Could not back up the project before migration; no schema changes were made") from exc
     database = sqlite3.connect(path, timeout=60)
     try:
         database.row_factory = sqlite3.Row

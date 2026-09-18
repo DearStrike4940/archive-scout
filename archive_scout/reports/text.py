@@ -10,7 +10,6 @@ from typing import Iterable, Iterator
 
 from ..config import ProjectConfig
 from ..downloads.downloader import replay_url
-from ..database.repositories import apply_report_storage_policy
 from ..utils import atomic_write_lines, atomic_write_text, json_value, utc_now
 
 REPORT_FILENAMES = {
@@ -53,7 +52,7 @@ ERROR_QUERY = """
     FROM errors e
     LEFT JOIN captures c ON c.id=e.capture_id
     LEFT JOIN documents d ON d.id=e.document_id
-    WHERE e.resolved=0
+    WHERE e.resolved=0 AND e.ignored=0
     ORDER BY e.operation,e.category,e.last_seen,e.id
 """
 
@@ -172,7 +171,6 @@ def _site_issue_lines(database: sqlite3.Connection, fields: list[str]) -> Iterat
 def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) -> dict[str, Path]:
     """Write the user-selected reports for a CDX-only project."""
     report = config.report.normalized()
-    apply_report_storage_policy(database, report)
     root_reports = config.output_dir / "reports"
     root_reports.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
@@ -240,7 +238,6 @@ def generate_reports(
     scan_run_id: int,
 ) -> dict[str, Path]:
     report = config.report.normalized()
-    apply_report_storage_policy(database, report)
     run = database.execute(
         """
         SELECT sr.*,ks.name AS keyword_set_name,ks.keywords_json
@@ -257,6 +254,15 @@ def generate_reports(
     root_reports.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
 
+    order = {
+        "score": "m.score DESC,c.timestamp,c.original_url,m.id",
+        "oldest": "c.timestamp,c.original_url,m.id",
+        "newest": "c.timestamp DESC,c.original_url,m.id",
+        "url": "c.original_url,c.timestamp,m.id",
+    }[report.sort_order]
+    selection = (scan_run_id, config.minimum_score, report.max_matches or -1)
+    ranked_query = RANKED_SELECT.split("ORDER BY m.score DESC")[0] + f"ORDER BY {order} LIMIT ?"
+    url_query = MATCH_URL_SELECT.split("ORDER BY m.score DESC")[0] + f"ORDER BY {order} LIMIT ?"
     match_count = int(database.execute(
         """
         SELECT COUNT(*) FROM document_matches
@@ -264,6 +270,8 @@ def generate_reports(
         """,
         (scan_run_id, config.minimum_score),
     ).fetchone()[0])
+    if report.max_matches:
+        match_count = min(match_count, report.max_matches)
 
     keyword_counts: Counter[str] = Counter()
     need_keyword_counts = report.output_enabled("keyword_counts") and bool(report.fields_for("keyword_counts"))
@@ -280,11 +288,17 @@ def generate_reports(
     ranked_fields = report.fields_for("matches_ranked")
 
     def consume_match_rows(write_ranked: bool) -> Iterator[str]:
-        for rank, row in enumerate(database.execute(RANKED_SELECT, (scan_run_id, config.minimum_score)), 1):
+        for rank, row in enumerate(database.execute(ranked_query, selection), 1):
             hits = json_value(row["hits_json"], {}) if (need_keyword_counts or "keyword_hits" in ranked_fields) else {}
             fields = json_value(row["fields_json"], {}) if "keyword_hits" in ranked_fields else {}
             snippets = json_value(row["snippets_json"], []) if "snippets" in ranked_fields else []
             links = json_value(row["interesting_links_json"], []) if (need_interesting_links or "interesting_links" in ranked_fields) else []
+            if report.snippet_limit:
+                snippets = snippets[:report.snippet_limit]
+            if report.snippet_chars:
+                snippets = [value[:report.snippet_chars] for value in snippets]
+            if report.link_limit:
+                links = links[:report.link_limit]
             if need_keyword_counts:
                 keyword_counts.update(hits)
             if need_interesting_links and links:
@@ -341,7 +355,7 @@ def generate_reports(
             if not fields:
                 return
             seen: set[str] = set()
-            for row in database.execute(MATCH_URL_SELECT, (scan_run_id, config.minimum_score)):
+            for row in database.execute(url_query, selection):
                 value = str(row["original_url"])
                 if value not in seen:
                     seen.add(value)
@@ -359,7 +373,7 @@ def generate_reports(
             if not fields:
                 return
             seen: set[str] = set()
-            for row in database.execute(MATCH_URL_SELECT, (scan_run_id, config.minimum_score)):
+            for row in database.execute(url_query, selection):
                 value = replay_url(str(row["timestamp"]), str(row["original_url"]))
                 if value not in seen:
                     seen.add(value)
@@ -382,16 +396,13 @@ def generate_reports(
                 rows = database.execute("SELECT DISTINCT link FROM archive_scout_report_links ORDER BY link")
             else:
                 rows = database.execute("SELECT source,link FROM archive_scout_report_links ORDER BY source,link")
-            seen: set[str] = set()
             for row in rows:
                 values = {
                     "source_url": row["source"] if "source" in row.keys() else "",
                     "link": row["link"] if "link" in row.keys() else "",
                 }
                 line = _tab_line(values, fields)
-                if line not in seen:
-                    seen.add(line)
-                    yield line
+                yield line
 
         path = _write_report(root_reports, "interesting_links", interesting_lines(), run_dir=run_dir)
         paths["interesting_links"] = path

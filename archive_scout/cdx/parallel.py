@@ -93,10 +93,19 @@ def iter_cdx_pages(
 
     executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="archive-scout-cdx")
     pending: dict[Future[PageFetchResult], int] = {}
+    remaining = iter(pages)
+
+    def fill() -> None:
+        # Bound *results*, not merely worker threads. Submitting all 1,000 page
+        # numbers lets completed bodies pile up while SQLite consumes a page.
+        while len(pending) < worker_count * 2 and not stop_event.is_set():
+            page = next(remaining, None)
+            if page is None:
+                break
+            pending[executor.submit(fetch, int(page))] = int(page)
+
     try:
-        for page in pages:
-            future = executor.submit(fetch, int(page))
-            pending[future] = int(page)
+        fill()
         while pending:
             if stop_event.is_set():
                 raise Stopped
@@ -106,6 +115,8 @@ def iter_cdx_pages(
             for future in done:
                 pending.pop(future, None)
                 yield future.result()
+            done.clear()
+            fill()
     except Exception:
         for future in pending:
             future.cancel()

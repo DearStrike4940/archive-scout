@@ -23,15 +23,15 @@ from archive_scout.utils import normalize_search
 
 class V106ReleaseTests(unittest.TestCase):
     def test_release_identity(self):
-        self.assertEqual(VERSION, '1.0.7')
+        self.assertEqual(VERSION, '1.0.7.1')
         self.assertEqual(SCHEMA_VERSION, 8)
 
     def test_windows_file_version_metadata_matches_release(self):
         metadata = Path('packaging/windows/version_info.txt').read_text(encoding='utf-8')
-        self.assertIn('filevers=(1, 0, 7, 0)', metadata)
-        self.assertIn('prodvers=(1, 0, 7, 0)', metadata)
-        self.assertIn("StringStruct('FileVersion', '1.0.7')", metadata)
-        self.assertIn("StringStruct('ProductVersion', '1.0.7')", metadata)
+        self.assertIn('filevers=(1, 0, 7, 1)', metadata)
+        self.assertIn('prodvers=(1, 0, 7, 1)', metadata)
+        self.assertIn("StringStruct('FileVersion', '1.0.7.1')", metadata)
+        self.assertIn("StringStruct('ProductVersion', '1.0.7.1')", metadata)
 
     def test_url_filename_preserves_query_and_is_portable(self):
         a = url_filename('http://example.com/show.php?id=1&x=a')
@@ -48,7 +48,7 @@ class V106ReleaseTests(unittest.TestCase):
     def test_capture_and_media_names_use_same_url_policy(self):
         root = Path('/project')
         url = 'http://example.com/a/b.jpg?q=1'
-        self.assertEqual(capture_path(root, '20010102030405', url).name, url_filename(url))
+        self.assertEqual(capture_path(root, '20010102030405', url).name, url_filename(url) + '.txt')
         self.assertEqual(media_path(root, 'image', url).name, url_filename(url))
         self.assertEqual(media_path(root, 'image', url).parent, root / 'media' / 'images')
 

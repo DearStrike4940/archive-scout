@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.7.1
+
+- Visible, scrollable Reports workspace in Simple/Advanced modes, complete per-file/per-field controls, presets, sorting and result/snippet/link limits.
+- Report formatting no longer deletes scan evidence; optional lean enrichment is prospective.
+- New raw text captures use `.txt`; stronger binary/HTML-media validation, charset preservation and collision-safe paths.
+- Correct copied/encoded CDX targets, readable exact request previews and safe nested query quoting.
+- Bound completed CDX page bodies; reject partial JSON rows; avoid multiplying page-count timeouts.
+- Consistent proxies and backend initialization; validate and recover replay ranges without corrupt appends.
+- Fix Hitlist mid-batch resume loss, full-run rate-limit NameError and unbounded scanner retries. Defer full-run scanning until acquisition finishes.
+- Preserve schema 8, default acquisition pacing, media-only collapse and the automation CLI contract.
+
 ## 1.0.7
 
 - Keeps the v1.0.5-style acquisition envelope intact: native Timemap `pageSize=9`, ten bounded CDX workers at the established 0.75-second shared spacing, and ten replay workers at 0.125-second request-start spacing, while retaining durable page/download resume and later correctness safeguards.

@@ -59,7 +59,7 @@ jobs:
         run: >-
           python -c "import importlib.metadata, archive_scout, archive_scout.app, archive_scout.cli, ahocorasick_rs;
           from selectolax.lexbor import LexborHTMLParser;
-          assert importlib.metadata.version('archive-scout') == '1.0.7';
+          assert importlib.metadata.version('archive-scout') == '1.0.7.1';
           print('Archive Scout native accelerator imports and metadata checks passed')"
 
       - name: Run tests

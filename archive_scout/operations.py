@@ -120,7 +120,11 @@ def _secondary_media_config(config: ProjectConfig) -> ProjectConfig:
         collapses = ["urlkey"]
     else:
         collapses = [value for value in normalized.cdx_collapses if value != "urlkey"]
-    return replace(normalized, cdx_collapses=collapses).normalized()
+    # Advanced text parameters must not sneak a second collapse policy back
+    # into the follow-up media request. Keep unrelated user parameters intact.
+    media_extra = [line for line in normalized.cdx_extra_params
+                   if line.partition("=")[0].strip().casefold() != "collapse"]
+    return replace(normalized, cdx_collapses=collapses, cdx_extra_params=media_extra).normalized()
 
 
 def run_project(
@@ -148,6 +152,9 @@ def run_project(
     if mode in {"all", "external_media_after_scan", "download", "resume", "rescan", "retry_errors"} and not config.selected_keyword_sets():
         raise ValueError("select at least one keyword set")
     stop_event = stop_event or threading.Event()
+    emit(callback, ProgressEvent("starting", "Opening project database; large projects may need recovery or migration…"))
+    if stop_event.is_set():
+        raise Stopped
     config.output_dir.mkdir(parents=True, exist_ok=True)
     (config.output_dir / "captures").mkdir(exist_ok=True)
     (config.output_dir / "media" / "images").mkdir(parents=True, exist_ok=True)

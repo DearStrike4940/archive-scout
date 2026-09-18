@@ -381,8 +381,10 @@ def save_match(
             excluded,required_missing,proximity_json,created_at,updated_at
         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(scan_run_id,document_id) DO UPDATE SET
-            score=excluded.score,hits_json=excluded.hits_json,fields_json=excluded.fields_json,
-            snippets_json=excluded.snippets_json,interesting_links_json=excluded.interesting_links_json,
+            score=excluded.score,hits_json=COALESCE(excluded.hits_json,document_matches.hits_json),
+            fields_json=COALESCE(excluded.fields_json,document_matches.fields_json),
+            snippets_json=COALESCE(excluded.snippets_json,document_matches.snippets_json),
+            interesting_links_json=COALESCE(excluded.interesting_links_json,document_matches.interesting_links_json),
             excluded=excluded.excluded,required_missing=excluded.required_missing,
             proximity_json=excluded.proximity_json,updated_at=excluded.updated_at
         WHERE document_matches.score IS NOT excluded.score
@@ -411,61 +413,17 @@ def save_match(
         database.execute("DELETE FROM keyword_hits WHERE match_id=?", (match_id,))
     if create_default_reviews:
         database.execute("INSERT OR IGNORE INTO reviews(match_id,status) VALUES(?,'unreviewed')", (match_id,))
-    else:
-        # Default, untouched review rows exist solely to print "unreviewed" in
-        # reports. Do not keep them when that field is disabled; preserve any
-        # actual human review state.
-        database.execute(
-            "DELETE FROM reviews WHERE match_id=? AND status='unreviewed' AND reviewer IS NULL AND reviewed_at IS NULL",
-            (match_id,),
-        )
     return match_id
 
 
 def apply_report_storage_policy(database: sqlite3.Connection, report_config) -> int:
-    """Drop obsolete report-only payloads once when report preferences change.
+    """Compatibility hook: report visibility must never erase past scan data.
 
-    The policy fingerprint lives in project_meta, so large document_matches tables
-    are not revisited on every operation. Core match score/linkage and all capture
-    manifest/retry state remain untouched. SQLite may retain freed pages until a
-    later Compact Project/VACUUM, but disabled enrichment is no longer live data
-    and no new rows store it.
+    v1.0.7 rewrote every historical match when a checkbox changed. Apart from
+    expensive writes, that made regeneration, exports and AI lose evidence.
+    Lean enrichment is now a prospective setting handled by save_match only.
     """
-    report = report_config.normalized() if hasattr(report_config, "normalized") else report_config
-    policy = {
-        "hits": bool(report.store_keyword_counts),
-        "hit_fields": bool(report.store_keyword_fields),
-        "snippets": bool(report.store_snippets),
-        "interesting_links": bool(report.store_interesting_links),
-        "default_reviews": bool(report.create_default_reviews),
-    }
-    fingerprint = json.dumps(policy, sort_keys=True, separators=(",", ":"))
-    row = database.execute(
-        "SELECT value FROM project_meta WHERE key='report_storage_policy_v1'"
-    ).fetchone()
-    if row and str(row[0]) == fingerprint:
-        return 0
-
-    before = database.total_changes
-    if not policy["hits"]:
-        database.execute("UPDATE document_matches SET hits_json=NULL WHERE hits_json IS NOT NULL")
-    if not policy["hit_fields"]:
-        database.execute("UPDATE document_matches SET fields_json=NULL WHERE fields_json IS NOT NULL")
-    if not policy["snippets"]:
-        database.execute("UPDATE document_matches SET snippets_json=NULL WHERE snippets_json IS NOT NULL")
-    if not policy["interesting_links"]:
-        database.execute(
-            "UPDATE document_matches SET interesting_links_json=NULL WHERE interesting_links_json IS NOT NULL"
-        )
-    if not policy["default_reviews"]:
-        database.execute(
-            "DELETE FROM reviews WHERE status='unreviewed' AND reviewer IS NULL AND reviewed_at IS NULL"
-        )
-    database.execute(
-        "INSERT OR REPLACE INTO project_meta(key,value) VALUES('report_storage_policy_v1',?)",
-        (fingerprint,),
-    )
-    return database.total_changes - before
+    return 0
 
 
 def record_recovery_event(

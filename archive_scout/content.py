@@ -82,18 +82,17 @@ def title_from_html(raw: str) -> str:
     return clean_space(html.unescape(TAG_PATTERN.sub(" ", match.group(1))))[:500]
 
 
-def detect_encoding(data: bytes, content_type: str = "") -> str:
-    """Choose a decoding label without treating UTF-16/32 NUL bytes as binary."""
+def _encoding_candidates(data: bytes, content_type: str = "") -> list[str]:
     if data.startswith(codecs.BOM_UTF8):
-        return "utf-8-sig"
+        return ["utf-8-sig", "utf-8"]
     if data.startswith(codecs.BOM_UTF32_LE):
-        return "utf-32-le"
+        return ["utf-32-le"]
     if data.startswith(codecs.BOM_UTF32_BE):
-        return "utf-32-be"
+        return ["utf-32-be"]
     if data.startswith(codecs.BOM_UTF16_LE):
-        return "utf-16-le"
+        return ["utf-16-le"]
     if data.startswith(codecs.BOM_UTF16_BE):
-        return "utf-16-be"
+        return ["utf-16-be"]
     candidates: list[str] = []
     charset_match = CHARSET_PATTERN.search(content_type or "")
     if charset_match:
@@ -115,42 +114,66 @@ def detect_encoding(data: bytes, content_type: str = "") -> str:
         elif even_nuls / halves > 0.25 and odd_nuls / halves < 0.05:
             candidates.append("utf-16-be")
     candidates.extend(["utf-8", "windows-1252", "latin-1"])
-    for encoding in dict.fromkeys(value.casefold() for value in candidates if value):
+    return list(dict.fromkeys(value.casefold() for value in candidates if value))
+
+
+def decode_bytes_with_encoding(data: bytes, content_type: str = "") -> tuple[str, str]:
+    """Decode once, retaining both the source and its actual encoding label."""
+    candidates = _encoding_candidates(data, content_type)
+    for encoding in candidates:
         try:
-            codecs.lookup(encoding)
-            data.decode(encoding)
-            return encoding
+            return data.decode(encoding), encoding
         except (LookupError, UnicodeDecodeError):
             continue
-    return "utf-8"
+    encoding = candidates[0] if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)) else "utf-8"
+    return data.decode(encoding, "replace"), encoding
+
+
+def detect_encoding(data: bytes, content_type: str = "") -> str:
+    return decode_bytes_with_encoding(data, content_type)[1]
 
 
 def decode_bytes(data: bytes, content_type: str = "") -> str:
-    encoding = detect_encoding(data, content_type)
-    try:
-        return data.decode(encoding)
-    except (LookupError, UnicodeDecodeError):
-        return data.decode("utf-8", "replace")
+    return decode_bytes_with_encoding(data, content_type)[0]
+
+
+def has_binary_signature(data: bytes) -> bool:
+    """Recognize containers before believing a server's often incorrect MIME.
+
+    SVG is deliberately absent: it is XML and remains searchable as text, while
+    the media workflow may independently retain it as an image.
+    """
+    return data.startswith((
+        b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a",
+        b"II*\x00", b"MM\x00*", b"\x00\x00\x01\x00", b"\x00\x00\x02\x00",
+        b"%PDF-", b"PK\x03\x04", b"PK\x05\x06", b"\x1f\x8b", b"Rar!",
+        b"7z\xbc\xaf\x27\x1c", b"\xd0\xcf\x11\xe0", b"\x7fELF", b"SQLite format 3\x00",
+        b"OggS", b"fLaC", b"\x1a\x45\xdf\xa3", b"\x30\x26\xb2\x75\x8e\x66\xcf\x11",
+    )) or (
+        len(data) >= 12 and (
+            (data[:4] == b"RIFF" and data[8:12] in {b"WEBP", b"WAVE", b"AVI "})
+            or data[4:8] == b"ftyp"
+        )
+    ) or (data.startswith(b"ID3") and len(data) >= 10 and data[3] in {2, 3, 4})
 
 
 def looks_textual_bytes(data: bytes, content_type: str = "") -> bool:
-    mime = (content_type or "").split(";", 1)[0].strip().casefold()
-    if mime.startswith("text/") or any(token in mime for token in ("html", "xml", "json", "javascript", "svg")):
-        return True
-    if data.startswith((codecs.BOM_UTF8, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
-        return True
+    if has_binary_signature(data):
+        return False
     if not data:
         return True
-    encoding = detect_encoding(data[:16384], content_type)
-    if encoding.startswith(("utf-16", "utf-32")):
+    for encoding in _encoding_candidates(data[:16384], content_type):
+        if not encoding.startswith(("utf-16", "utf-32")):
+            continue
         try:
-            decoded = data[:16384].decode(encoding, "strict")
+            # A bounded preview may end in half a character/surrogate pair.
+            decoded = codecs.getincrementaldecoder(encoding)("strict").decode(data[:16384], final=False)
             if decoded and sum(ch.isprintable() or ch.isspace() for ch in decoded) / max(1, len(decoded)) > 0.85:
                 return True
-        except UnicodeDecodeError:
+        except (LookupError, UnicodeDecodeError):
             pass
-    if mime.startswith(("image/", "audio/", "video/", "font/")) and "svg" not in mime:
-        return False
+    # Once metadata was ambiguous enough to fetch, printable source wins over
+    # misleading image/video headers too (for example a PHP page ending .jpg).
     sample = data[:8192]
     if b"\x00" in sample:
         return False

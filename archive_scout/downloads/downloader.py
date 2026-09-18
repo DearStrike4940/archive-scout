@@ -16,10 +16,11 @@ from ..cdx.parameters import cdx_query_signature
 from ..config import ProjectConfig
 from ..constants import REPLAY_URL
 from ..content import (
+    CHARSET_PATTERN,
     classify_replay_content,
     classify_text_candidate,
     decode_bytes,
-    detect_encoding,
+    decode_bytes_with_encoding,
     looks_textual_bytes,
     parse_page,
 )
@@ -43,7 +44,7 @@ from ..utils import hash_text, normalize_search, utc_now
 from .rate_limit import SharedFixedRateLimiter, shared_host_gate
 from .validation import classify_exception
 
-CLASSIFIER_REVISION = 1
+CLASSIFIER_REVISION = 2
 
 
 def replay_url(timestamp: str, original: str, modifier: str = "id_") -> str:
@@ -58,21 +59,31 @@ def capture_path(root: Path, capture_id: int, timestamp: str, original: str) -> 
     return url_capture_path(root, timestamp, original)
 
 
-def _allocate_capture_path(database: sqlite3.Connection, root: Path, row: sqlite3.Row) -> Path:
+def _allocate_capture_path(database: sqlite3.Connection, root: Path, row: sqlite3.Row, reserved: set[str] | None = None) -> Path:
     existing = str(row["local_path"] or "") if "local_path" in row.keys() else ""
     if existing:
         return Path(existing)
     candidate = url_capture_path(root, str(row["timestamp"]), str(row["original_url"]))
-    conflict = database.execute(
-        "SELECT id FROM captures WHERE id<>? AND local_path=? LIMIT 1",
-        (int(row["id"]), str(candidate)),
-    ).fetchone()
-    if conflict or candidate.exists():
-        # Existing v1.0.x archives can contain a path not yet backfilled into
-        # captures.local_path. Preserve it and minimally disambiguate this capture.
-        return url_capture_path(
-            root, str(row["timestamp"]), str(row["original_url"]), disambiguate=True
-        )
+    def occupied(path: Path) -> bool:
+        return str(path) in (reserved or ()) or path.exists() or database.execute(
+            "SELECT id FROM captures WHERE id<>? AND local_path=? LIMIT 1",
+            (int(row["id"]), str(path)),
+        ).fetchone() is not None
+
+    if occupied(candidate):
+        candidate = url_capture_path(root, str(row["timestamp"]), str(row["original_url"]), disambiguate=True)
+        if occupied(candidate):
+            # Escaping URL characters can collide with an already-percent-
+            # escaped URL, even at the same timestamp. Never adopt another
+            # capture's file just because the portable spelling is identical.
+            base = url_capture_path(root, str(row["timestamp"]), str(row["original_url"]))
+            counter = 0
+            while True:
+                suffix = f"~c{int(row['id'])}" + (f"-{counter}" if counter else "")
+                candidate = base.with_name(base.stem + suffix + ".txt")
+                if not occupied(candidate):
+                    break
+                counter += 1
     return candidate
 
 
@@ -358,6 +369,8 @@ def _download_capture(
             size = _size
         with path.open("rb") as handle:
             preview = handle.read(16384)
+        if not looks_textual_bytes(preview, str(row.get("mimetype") or "")):
+            return {"kind": "non_text", "capture_id": int(row["id"])}
         return {
             "kind": "downloaded",
             "capture_id": int(row["id"]), "path": path, "bytes_saved": size,
@@ -398,6 +411,7 @@ def _download_capture(
         temp.unlink(missing_ok=True)
         raise RuntimeError(replay_problem)
     os.replace(temp, path)
+    charset = CHARSET_PATTERN.search(str(content_type))
     return {
         "kind": "downloaded",
         "capture_id": int(row["id"]), "path": path,
@@ -405,6 +419,7 @@ def _download_capture(
         "content_hash": str(response["content_hash"]),
         "http_status": response["status"], "final_url": response["final_url"],
         "content_type": str(content_type), "preview": preview,
+        "encoding": charset.group(1) if charset else "",
     }
 
 
@@ -413,11 +428,12 @@ def _scan_saved_capture(
 ) -> dict:
     data = path.read_bytes()
     content_type = str(row.get("mimetype") or "")
+    if row.get("detected_encoding"):
+        content_type += "; charset=" + str(row["detected_encoding"])
     if not looks_textual_bytes(data[:16384], content_type):
         return {"kind": "non_text", "capture_id": int(row["id"]), "path": path}
-    encoding = detect_encoding(data[:65536], content_type)
     content_hash = str(row.get("content_hash") or "") or hashlib.sha256(data).hexdigest()
-    raw = decode_bytes(data, content_type)
+    raw, encoding = decode_bytes_with_encoding(data, content_type)
     # The decoded source is the canonical scan input from this point onward.
     # Releasing the byte buffer before DOM/normalization work avoids keeping
     # both a potentially huge bytes object and several Unicode views alive.
@@ -589,6 +605,7 @@ def download_archive(
         ))
 
     queued_scan_ids: set[int] = set()
+    failed_scan_ids: set[int] = set()
 
     def fill_waiting_from_database() -> None:
         capacity = max(0, scan_limit - len(waiting_scan) - len(scan_futures))
@@ -596,7 +613,7 @@ def download_archive(
             return
         for pending_row in _pending_scan_rows(database, config, capture_ids):
             capture_id = int(pending_row["id"])
-            if capture_id in queued_scan_ids:
+            if capture_id in queued_scan_ids or capture_id in failed_scan_ids:
                 continue
             queued_scan_ids.add(capture_id)
             waiting_scan.append(dict(pending_row))
@@ -605,6 +622,10 @@ def download_archive(
                 break
 
     def schedule_waiting(scan_pool: concurrent.futures.ThreadPoolExecutor) -> None:
+        # Drain replay first: local parsing/matching should not compete with
+        # acquisition for CPU, memory or SQLite writes. The backlog is durable.
+        if not rows_exhausted or download_futures:
+            return
         if len(waiting_scan) + len(scan_futures) < scan_limit:
             fill_waiting_from_database()
         slots = max(0, scan_limit - len(scan_futures))
@@ -650,12 +671,7 @@ def download_archive(
                             rows_exhausted = True
                             break
                         row_dict = dict(row)
-                        path = _allocate_capture_path(database, config.output_dir, row)
-                        if str(path) in reserved_paths:
-                            path = url_capture_path(
-                                config.output_dir, str(row["timestamp"]), str(row["original_url"]),
-                                disambiguate=True,
-                            )
+                        path = _allocate_capture_path(database, config.output_dir, row, reserved_paths)
                         reserved_paths.add(str(path))
                         row_dict["assigned_path"] = str(path)
                         batch.append((row_dict, path))
@@ -692,10 +708,11 @@ def download_archive(
                         # deferred to Compact Project / idle maintenance, never the replay hot path.
                         with database:
                             database.execute(
-                                """UPDATE captures SET state='downloaded_unscanned',local_path=?,content_hash=?,http_status=?,final_url=?,bytes_saved=?,skip_reason=NULL,classifier_revision=?,updated_at=? WHERE id=?""",
-                                (str(path), content_hash, result["http_status"], result["final_url"], result["bytes_saved"], CLASSIFIER_REVISION, utc_now(), capture_id),
+                                """UPDATE captures SET state='downloaded_unscanned',local_path=?,content_hash=?,http_status=?,final_url=?,bytes_saved=?,skip_reason=NULL,classifier_revision=?,detected_encoding=COALESCE(NULLIF(?,''),detected_encoding),updated_at=? WHERE id=?""",
+                                (str(path), content_hash, result["http_status"], result["final_url"], result["bytes_saved"], CLASSIFIER_REVISION, str(result.get("encoding") or ""), utc_now(), capture_id),
                             )
                         row.update(result)
+                        row["detected_encoding"] = result.get("encoding") or row.get("detected_encoding")
                         row["local_path"] = str(path)
                         # Keep local scan memory bounded. If full, SQLite remains the queue.
                         if len(waiting_scan) + len(scan_futures) < scan_limit:
@@ -704,9 +721,10 @@ def download_archive(
                         completed_downloads += 1
                         downloaded_for_scan += 1
                     except RateLimitDeferred:
-                        flush_results(force=True)
                         with database:
                             database.execute("UPDATE captures SET state='pending',updated_at=? WHERE id=?", (utc_now(), capture_id))
+                        raise
+                    except Stopped:
                         raise
                     except Exception as exc:
                         failures += 1
@@ -740,6 +758,7 @@ def download_archive(
                         for row, outcome in scan_results:
                             capture_id = int(row["id"])
                             if isinstance(outcome, BaseException):
+                                failed_scan_ids.add(capture_id)
                                 failures += 1
                                 record_error(database, "scan", "scan_failure", repr(outcome), capture_id=capture_id, retryable=True)
                                 database.execute("UPDATE captures SET state='downloaded_unscanned',updated_at=? WHERE id=?", (utc_now(), capture_id))
@@ -847,7 +866,7 @@ def download_archive_only(
     last_emit = 0.0
     last_flush = started
     flush_count = max(32, min(128, config.workers * 8))
-    success_buffer: list[tuple[str, str, int, str, int, int, int]] = []
+    success_buffer: list[tuple[str, str, int, str, int, int, int, str]] = []
     skipped_buffer: list[int] = []
     error_buffer: list[tuple[int, dict[str, object], BaseException]] = []
 
@@ -870,18 +889,19 @@ def download_archive_only(
                     """UPDATE captures SET state='downloaded_unscanned',local_path=?,
                        content_hash=?,http_status=?,final_url=?,bytes_saved=?,
                        skip_reason=NULL,classifier_revision=?,
+                       detected_encoding=COALESCE(NULLIF(?,''),detected_encoding),
                        download_attempts=download_attempts+1,updated_at=? WHERE id=?""",
                     (
                         (path, content_hash, http_status, final_url, bytes_saved,
-                         classifier_revision, now, capture_id)
+                         classifier_revision, encoding, now, capture_id)
                         for path, content_hash, http_status, final_url, bytes_saved,
-                            classifier_revision, capture_id in success_buffer
+                            classifier_revision, capture_id, encoding in success_buffer
                     ),
                 )
                 # Resolve earlier capture errors in one indexed UPDATE instead of
                 # one statement per successful replay. Buffers are intentionally
                 # small, so this remains below SQLite's variable limit.
-                success_ids = [row[-1] for row in success_buffer]
+                success_ids = [row[-2] for row in success_buffer]
                 placeholders = ",".join("?" for _ in success_ids)
                 database.execute(
                     "UPDATE errors SET resolved=1,last_seen=? WHERE resolved=0 "
@@ -942,14 +962,7 @@ def download_archive_only(
                 rows_exhausted = True
                 break
             item = dict(row)
-            path = _allocate_capture_path(database, config.output_dir, row)
-            if str(path) in reserved_paths:
-                path = url_capture_path(
-                    config.output_dir,
-                    str(row["timestamp"]),
-                    str(row["original_url"]),
-                    disambiguate=True,
-                )
+            path = _allocate_capture_path(database, config.output_dir, row, reserved_paths)
             reserved_paths.add(str(path))
             item["assigned_path"] = str(path)
             staged.append((item, path))
@@ -1045,10 +1058,11 @@ def download_archive_only(
                         success_buffer.append((
                             str(path), str(result["content_hash"]), int(result["http_status"]),
                             str(result["final_url"]), int(result["bytes_saved"]),
-                            CLASSIFIER_REVISION, capture_id,
+                            CLASSIFIER_REVISION, capture_id, str(result.get("encoding") or ""),
                         ))
                         downloaded += 1
                     except RateLimitDeferred:
+                        flush_results(force=True)
                         with database:
                             database.execute(
                                 """UPDATE captures SET state='pending',

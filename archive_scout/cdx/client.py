@@ -20,13 +20,14 @@ from ..events import Stopped
 from ..json_codec import JSONDecodeErrors, loads as json_loads
 from ..network.transports import (
     ResilientTransport,
+    InvalidRangeResponse,
     TransportExhaustedError,
     is_transport_connection_failure,
     is_transport_read_timeout,
     is_transport_timeout,
 )
 from ..runtime import ensure_frozen_bundle_available, frozen_bundle_error_from_exception, is_missing_frozen_bundle_error
-from ..utils import clean_space
+from ..utils import clean_space, cdx_request_url
 
 
 class TransientRequestError(RuntimeError):
@@ -340,11 +341,15 @@ class HttpClient:
         rate_attempt = 0
         total_rate_wait = 0.0
         destination = Path(destination)
+        range_restarts = 0
 
         while True:
             ensure_frozen_bundle_available()
             existing_size = destination.stat().st_size if destination.exists() else 0
             request_headers = dict(headers)
+            # Partial offsets are only meaningful for the identity encoding,
+            # including the first request before an interruption occurs.
+            request_headers["Accept-Encoding"] = "identity"
             if existing_size > 0:
                 request_headers["Range"] = f"bytes={existing_size}-"
                 # Range offsets apply to the identity representation.
@@ -368,6 +373,11 @@ class HttpClient:
                             compute_hash=False,
                         )
                 status = int(response.status)
+                if status == 416 and existing_size:
+                    raise InvalidRangeResponse("server rejected saved replay offset; restarting complete file")
+                if status < 200 or status >= 300:
+                    if status < 400:
+                        raise TransientRequestError(f"unexpected replay HTTP {status}: {url}")
                 retry_after_header = response.headers.get("retry-after") or response.headers.get("Retry-After")
                 if status in {429, 503}:
                     destination.unlink(missing_ok=True)
@@ -414,6 +424,15 @@ class HttpClient:
                     "backend": response.backend,
                     "elapsed": response.elapsed,
                 }
+            except InvalidRangeResponse as exc:
+                self.host_gate.finish_request(permit, recovered=False)
+                destination.unlink(missing_ok=True)
+                range_restarts += 1
+                if range_restarts > 1:
+                    raise TransientRequestError(str(exc), splittable=False) from exc
+                if self.retry_callback:
+                    self.retry_callback(1, 1, str(exc), 0.0)
+                continue
             except RateLimitDeferred:
                 destination.unlink(missing_ok=True)
                 self.host_gate.finish_request(permit, recovered=False)
@@ -530,7 +549,7 @@ class HttpClient:
             first_error: BaseException | None = None
             for format_name in attempts:
                 request_params = text_params if format_name == "text" else params
-                full_url = endpoint + "?" + urllib.parse.urlencode(request_params, doseq=True)
+                full_url = cdx_request_url(endpoint, request_params)
                 try:
                     accept = "text/plain,*/*" if format_name == "text" else "application/json,text/plain,*/*"
                     response = self.get(full_url, max_bytes, accept)
@@ -647,7 +666,7 @@ class HttpClient:
             first_error: BaseException | None = None
             for format_name in attempts:
                 request_params = text_params if format_name == "text" else params
-                full_url = endpoint + "?" + urllib.parse.urlencode(request_params, doseq=True)
+                full_url = cdx_request_url(endpoint, request_params)
                 try:
                     accept = "text/plain,*/*" if format_name == "text" else "application/json,text/plain,*/*"
                     response = self.get(full_url, max_bytes, accept)
@@ -758,7 +777,7 @@ class HttpClient:
             raise ValueError("at least one endpoint is required")
         failures: list[tuple[str, TransientRequestError]] = []
         for endpoint in endpoints:
-            full_url = endpoint + "?" + urllib.parse.urlencode(params, doseq=True)
+            full_url = cdx_request_url(endpoint, params)
             try:
                 response = self.get(full_url, max_bytes, "application/json,*/*")
                 payload = parse_json_response(response["data"], endpoint)
@@ -975,7 +994,7 @@ def _iter_binary_lines(data: bytes | bytearray):
 
 def parse_cdx_rows_payload(payload: object) -> CDXRows:
     """Convert JSON-style CDX data directly to compact tuples."""
-    if payload in (None, []):
+    if payload == []:
         return CDXRows([])
     if isinstance(payload, dict):
         message = str(payload.get("message") or payload.get("error") or payload)
@@ -984,7 +1003,7 @@ def parse_cdx_rows_payload(payload: object) -> CDXRows:
             return CDXRows([])
         raise RuntimeError(message)
     if not isinstance(payload, list) or not payload:
-        return CDXRows([])
+        raise MalformedCDXResponse("unexpected CDX JSON payload", splittable=True)
     header = payload[0]
     if not isinstance(header, list):
         raise RuntimeError("unexpected CDX response header")
@@ -1007,9 +1026,11 @@ def parse_cdx_rows_payload(payload: object) -> CDXRows:
     rows: list[CDXRow] = []
     for item in body:
         if not isinstance(item, list) or len(item) != len(header):
-            continue
+            raise MalformedCDXResponse("incomplete CDX JSON row; page must be retried", splittable=True)
         timestamp = value(item, "timestamp")
         original = value(item, "original")
+        if not re.fullmatch(r"\d{14}", timestamp) or not original:
+            raise MalformedCDXResponse("invalid CDX timestamp or URL; page must be retried", splittable=True)
         if timestamp and original:
             rows.append(
                 (

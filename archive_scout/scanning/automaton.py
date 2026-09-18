@@ -147,3 +147,28 @@ class LiteralAutomaton:
         matches: set[str] = set()
         self.find_into(text, matches)
         return matches
+
+    def count_non_overlapping(self, text: str, chunk_size: int = 65536) -> dict[str, int]:
+        """Count per-pattern matches with bounded native-result allocation.
+
+        Carry enough source overlap to retain phrases at chunk boundaries. Each
+        match is owned by the chunk containing its end; per-pattern end offsets
+        give the same counts as literal regex finditer without sorting/storing
+        all occurrences in a multi-megabyte capture.
+        """
+        if not text or not self.patterns:
+            return {}
+        overlap = max(map(len, self.patterns)) - 1
+        width = max(1, int(chunk_size), overlap + 1)
+        counts: dict[str, int] = {}
+        last_end: dict[str, int] = {}
+        for boundary in range(0, len(text), width):
+            start = max(0, boundary - overlap)
+            for pattern, left, right in self.find_matches(text[start:boundary + width]):
+                left += start
+                right += start
+                if right <= boundary or left < last_end.get(pattern, -1):
+                    continue
+                counts[pattern] = counts.get(pattern, 0) + 1
+                last_end[pattern] = right
+        return counts

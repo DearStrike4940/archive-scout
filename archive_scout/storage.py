@@ -60,7 +60,12 @@ def with_timestamp_disambiguator(filename: str, timestamp: str) -> str:
 
 
 def capture_path(root: Path, timestamp: str, original_url: str, *, disambiguate: bool = False) -> Path:
-    filename = url_filename(original_url, 'capture')
+    # Keep the original URL recognizable while making the research corpus safe
+    # to open in text tools. Bytes are not decoded/re-encoded or stripped here.
+    # Reserve space for .txt, a timestamp and the temporary .part suffix.
+    filename = url_filename(original_url, 'capture', max_utf8_bytes=225)
+    if not filename.casefold().endswith('.txt'):
+        filename += '.txt'
     if disambiguate:
         filename = with_timestamp_disambiguator(filename, timestamp)
     year = str(timestamp or '')[:4] if len(str(timestamp or '')) >= 4 else 'unknown'

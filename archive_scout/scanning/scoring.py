@@ -180,13 +180,7 @@ def analyze_content(
     for field_name, value in fields.items():
         normalized_value = normalized_fields[field_name]
         if literal_auto is not None:
-            spans_by_expression: dict[str, list[tuple[int, int]]] = {}
-            for expression, start, end in literal_auto.find_matches(normalized_value, overlapping=True):
-                spans_by_expression.setdefault(expression, []).append((start, end))
-            for expression, spans in spans_by_expression.items():
-                count = _non_overlapping_count(spans)
-                if not count:
-                    continue
+            for expression, count in literal_auto.count_non_overlapping(normalized_value).items():
                 for item in literal_map.get(expression, ()):
                     label = item.rule.label
                     hits[label] += count

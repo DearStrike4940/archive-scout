@@ -8,7 +8,6 @@ import subprocess
 import sys
 import threading
 import traceback
-import urllib.parse
 import webbrowser
 import tkinter as tk
 from datetime import datetime
@@ -18,7 +17,8 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from ..ai.relevance import AIReviewError, run_ai_review
 from ..ai.reports import generate_ai_reports
 from ..cdx.client import RateLimitDeferred
-from ..cdx.parameters import build_cdx_params, cdx_year_window
+from ..cdx.parameters import build_cdx_params, build_num_pages_params, cdx_year_window, cdx_endpoints, cdx_paged_endpoints, preferred_index_strategy
+from ..utils import cdx_request_url
 from ..config import (
     AIConfig,
     AnalysisConfig,
@@ -33,7 +33,7 @@ from ..config import (
     load_project_config,
     save_project_config,
 )
-from ..constants import APP_NAME, CDX_URL, DEFAULT_IMAGE_EXTENSIONS, DEFAULT_VIDEO_EXTENSIONS, OPERATION_MODES, REVIEW_STATUSES, SCOPE_LABELS, VERSION
+from ..constants import APP_NAME, DEFAULT_IMAGE_EXTENSIONS, DEFAULT_VIDEO_EXTENSIONS, OPERATION_MODES, REVIEW_STATUSES, SCOPE_LABELS, VERSION
 from ..database.connection import open_database
 from ..database.repositories import (
     ai_result_rows,
@@ -206,6 +206,12 @@ class ArchiveScoutApp(tk.Tk):
         self.max_file_var = tk.StringVar(value="25")
         self.minimum_score_var = tk.StringVar(value="1")
         self.report_output_vars = {name: tk.BooleanVar(value=True) for name in REPORT_OUTPUT_NAMES}
+        self.report_retain_var = tk.BooleanVar(value=True)
+        self.report_sort_var = tk.StringVar(value="score")
+        self.report_max_var = tk.StringVar(value="0")
+        self.report_snippets_var = tk.StringVar(value="0")
+        self.report_chars_var = tk.StringVar(value="0")
+        self.report_links_var = tk.StringVar(value="0")
         self.report_field_vars = {
             name: {field: tk.BooleanVar(value=True) for field in REPORT_FIELD_NAMES[name]}
             for name in REPORT_OUTPUT_NAMES
@@ -436,7 +442,7 @@ class ArchiveScoutApp(tk.Tk):
         self.bind_all(f"<{modifier}-f>", lambda _e: self.show_page("Results and search"))
 
     def refresh_navigation(self) -> None:
-        allowed_simple = {"Dashboard", "Sites and paths", "Keyword sets", "Results and search", "AI relevance", "Research intelligence", "Errors", "Activity"}
+        allowed_simple = {"Dashboard", "Sites and paths", "Keyword sets", "Media", "Reports", "Archive analysis", "Results and search", "AI relevance", "Research intelligence", "Errors", "Activity"}
         for button in self.nav_buttons.values():
             button.destroy()
         self.nav_buttons.clear()
@@ -751,24 +757,44 @@ class ArchiveScoutApp(tk.Tk):
     def create_reports_tab(self) -> None:
         tab = ttk.Frame(self.notebook, padding=10)
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(2, weight=1)
+        tab.rowconfigure(3, weight=1)
         self.notebook.add(tab, text="Reports")
         ttk.Label(tab, text="Report contents", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             tab,
             text=(
-                "Choose every report file Archive Scout writes and every field that appears inside it. "
-                "When report-only derived data such as snippets, keyword-hit detail, Interesting Links, or "
-                "default review rows is not needed by any enabled output, Archive Scout does not store that "
-                "payload in SQLite. Core URL/timestamp/queue/error state is always retained for resume, retry, "
-                "Hitlist, and project integrity."
+                "Customize generated text-scan, index, media and archive-analysis reports. "
+                "These settings never change which pages are acquired or matched, and never erase saved scan evidence. "
+                "Use Regenerate reports in Scan history to apply them without downloading again. "
+                "Hitlist, AI and manual export formats are separate operation outputs."
             ),
             wraplength=1080,
             style="Muted.TLabel",
         ).grid(row=1, column=0, sticky="ew", pady=(4, 10))
 
+        controls = ttk.Frame(tab)
+        controls.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        for column, (label, variable) in enumerate((
+            ("Minimum score", self.minimum_score_var),
+            ("Match limit", self.report_max_var),
+            ("Snippets / match", self.report_snippets_var),
+            ("Snippet characters", self.report_chars_var),
+            ("Links / match", self.report_links_var),
+        )):
+            ttk.Label(controls, text=label).grid(row=0, column=column, sticky="w", padx=(0, 10))
+            ttk.Entry(controls, textvariable=variable, width=12).grid(row=1, column=column, sticky="w", padx=(0, 10))
+        ttk.Label(controls, text="Sort matches").grid(row=0, column=5, sticky="w")
+        ttk.Combobox(controls, textvariable=self.report_sort_var, values=("score", "oldest", "newest", "url"), state="readonly", width=12).grid(row=1, column=5, sticky="w")
+        ttk.Label(controls, text="Limits: 0 = all available. Match sorting/limits apply consistently to all match-derived reports.", style="Muted.TLabel").grid(row=2, column=0, columnspan=6, sticky="w", pady=4)
+        ttk.Checkbutton(controls, text="Retain full scan details for later reports, review and AI (recommended)", variable=self.report_retain_var).grid(row=3, column=0, columnspan=6, sticky="w")
+        ttk.Label(controls, text="Unchecked: future scans omit unused enrichment; enabling it later requires a local rescan. Download-only is lean in either mode.", wraplength=1000, style="Muted.TLabel").grid(row=4, column=0, columnspan=6, sticky="w")
+        presets = ttk.Frame(controls)
+        presets.grid(row=5, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        for label, preset in (("All files and fields", "all"), ("Matched URLs only", "urls"), ("No generated reports", "none")):
+            ttk.Button(presets, text=label, command=lambda value=preset: self.set_report_preset(value)).pack(side="left", padx=(0, 8))
+
         book = ttk.Notebook(tab)
-        book.grid(row=2, column=0, sticky="nsew")
+        book.grid(row=3, column=0, sticky="nsew")
         groups = (
             ("Text and index", ("matches_ranked", "matched_urls", "wayback_urls", "interesting_links", "keyword_counts", "all_indexed_urls", "summary")),
             ("Errors", ("errors", "site_issues")),
@@ -801,10 +827,23 @@ class ArchiveScoutApp(tk.Tk):
         }
 
         for group_label, names in groups:
-            page = ttk.Frame(book, padding=8)
+            container = ttk.Frame(book)
+            container.columnconfigure(0, weight=1)
+            container.rowconfigure(0, weight=1)
+            canvas = tk.Canvas(container, highlightthickness=0)
+            scroll_y = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+            scroll_x = ttk.Scrollbar(container, orient="horizontal", command=canvas.xview)
+            canvas.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            scroll_y.grid(row=0, column=1, sticky="ns")
+            scroll_x.grid(row=1, column=0, sticky="ew")
+            page = ttk.Frame(canvas, padding=8)
+            window = canvas.create_window((0, 0), window=page, anchor="nw")
+            page.bind("<Configure>", lambda _event, c=canvas: c.configure(scrollregion=c.bbox("all")))
+            canvas.bind("<Configure>", lambda event, c=canvas, w=window, p=page: c.itemconfigure(w, width=max(event.width, p.winfo_reqwidth())))
             page.columnconfigure(0, weight=1)
             page.columnconfigure(1, weight=1)
-            book.add(page, text=group_label)
+            book.add(container, text=group_label)
             for index, name in enumerate(names):
                 row, column = divmod(index, 2)
                 box = ttk.LabelFrame(page, text=output_labels[name], padding=7)
@@ -833,6 +872,12 @@ class ArchiveScoutApp(tk.Tk):
     def set_report_fields(self, output_name: str, enabled: bool) -> None:
         for variable in self.report_field_vars.get(output_name, {}).values():
             variable.set(bool(enabled))
+
+    def set_report_preset(self, preset: str) -> None:
+        for name, variable in self.report_output_vars.items():
+            variable.set(preset == "all" or (preset == "urls" and name == "matched_urls"))
+            if preset in {"all", "urls"}:
+                self.set_report_fields(name, True)
 
     def create_analysis_tab(self) -> None:
         tab = ttk.Frame(self.notebook, padding=10)
@@ -911,7 +956,6 @@ class ArchiveScoutApp(tk.Tk):
             ("Download workers (10 = fast default)", self.workers_var),
             ("Scanner workers (0 = automatic)", self.scan_workers_var),
             ("Maximum text-page size (MB)", self.max_file_var),
-            ("Minimum report score", self.minimum_score_var),
             ("CDX request spacing (seconds)", self.cdx_delay_var),
             ("Download request spacing (0.125 = 8/sec)", self.download_delay_var),
             ("429/503 initial shared pause (seconds)", self.rate_limit_base_var),
@@ -1473,6 +1517,12 @@ class ArchiveScoutApp(tk.Tk):
                 download_scope=SCOPE_LABELS[self.scope_var.get()],
                 minimum_score=int(self.minimum_score_var.get()),
                 report=ReportConfig(
+                    retain_scan_details=self.report_retain_var.get(),
+                    sort_order=self.report_sort_var.get(),
+                    max_matches=int(self.report_max_var.get()),
+                    snippet_limit=int(self.report_snippets_var.get()),
+                    snippet_chars=int(self.report_chars_var.get()),
+                    link_limit=int(self.report_links_var.get()),
                     outputs=[name for name, variable in self.report_output_vars.items() if variable.get()],
                     fields={
                         name: [field for field, variable in variables.items() if variable.get()]
@@ -1519,16 +1569,34 @@ class ArchiveScoutApp(tk.Tk):
             window = cdx_year_window(config, config.from_year)
             if not window:
                 raise ValueError("The selected date range does not contain an indexable year.")
-            url = CDX_URL + "?" + urllib.parse.urlencode(build_cdx_params(config, config.targets[0], window[0], window[1]), doseq=True)
+            target = config.targets[0]
+            config = config.for_target(target)
+            window = cdx_year_window(config, config.from_year)
+            if not window:
+                raise ValueError("The target date range does not contain an indexable year.")
+            if preferred_index_strategy(config, target) == "paged":
+                network = config.network.normalized()
+                blocks = 9 if network.index_strategy == "auto" else network.page_blocks
+                params = build_num_pages_params(config, target, *window, blocks)
+                endpoint = cdx_paged_endpoints(config)[0]
+            else:
+                params = build_cdx_params(config, target, *window)
+                endpoint = cdx_endpoints(config)[0]
+            url = cdx_request_url(endpoint, params)
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
         dialog = tk.Toplevel(self)
         dialog.title("CDX request preview")
-        dialog.geometry("860x420")
+        dialog.geometry("860x540")
+        ttk.Label(dialog, text="First request for this target/window. Copy URL sends the exact valid request; parameters below are shown decoded.", wraplength=820).pack(anchor="w", padx=10, pady=(10, 0))
+        def copy_url():
+            dialog.clipboard_clear()
+            dialog.clipboard_append(url)
+        ttk.Button(dialog, text="Copy request URL", command=copy_url).pack(anchor="w", padx=10, pady=6)
         text = tk.Text(dialog, wrap="word", font="TkFixedFont")
         text.pack(fill="both", expand=True, padx=10, pady=10)
-        text.insert("1.0", url)
+        text.insert("1.0", url + "\n\nParameters (readable):\n" + "\n".join(f"{key} = {value}" for key, value in params))
         text.configure(state="disabled")
 
     def choose_output(self) -> None:
@@ -1570,7 +1638,19 @@ class ArchiveScoutApp(tk.Tk):
         self.stop_button.configure(state="normal")
         self.log(f"Starting {mode} in {config.output_dir}")
         self.worker_thread = threading.Thread(target=self.run_worker, args=(config, mode), daemon=True)
-        self.worker_thread.start()
+        try:
+            self.worker_thread.start()
+        except Exception as exc:
+            self.worker_thread = None
+            self.progress.stop()
+            self.start_button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
+            for name in ("ai_start_button", "research_search_button", "research_ai_button", "research_index_button"):
+                if hasattr(self, name):
+                    getattr(self, name).configure(state="normal")
+            self.status_var.set("Could not start operation")
+            self.log(f"Worker startup failed: {exc}")
+            messagebox.showerror(APP_NAME, f"Could not start operation: {exc}")
 
     def run_worker(self, config: ProjectConfig, mode: str) -> None:
         try:
@@ -2459,6 +2539,12 @@ class ArchiveScoutApp(tk.Tk):
         self.max_file_var.set(str(config.max_file_mb))
         self.minimum_score_var.set(str(config.minimum_score))
         report = config.report.normalized()
+        self.report_retain_var.set(report.retain_scan_details)
+        self.report_sort_var.set(report.sort_order)
+        self.report_max_var.set(str(report.max_matches))
+        self.report_snippets_var.set(str(report.snippet_limit))
+        self.report_chars_var.set(str(report.snippet_chars))
+        self.report_links_var.set(str(report.link_limit))
         for name, variable in self.report_output_vars.items():
             variable.set(report.output_enabled(name))
         for name, variables in self.report_field_vars.items():

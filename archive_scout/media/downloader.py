@@ -14,7 +14,7 @@ from ..database.repositories import blocked_site_reasons, record_error, record_s
 from ..downloads.downloader import replay_url
 from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
 from ..downloads.validation import classify_exception
-from ..content import classify_replay_content
+from ..content import classify_replay_content, has_binary_signature
 from ..events import ProgressEvent, Stopped
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..storage import url_filename, media_path as storage_media_path, sha256_file
@@ -75,12 +75,16 @@ def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient) -> 
     if not int(response["bytes"]):
         temp.unlink(missing_ok=True)
         raise RuntimeError("empty media response")
-    if "text/html" in content_type:
-        preview = bytes(response["preview"]).decode("utf-8", "ignore")
+    preview_bytes = bytes(response["preview"])
+    html_start = preview_bytes.lstrip().lower().startswith((b"<!doctype html", b"<html", b"<head", b"<body"))
+    if ("text/html" in content_type or html_start) and not has_binary_signature(preview_bytes):
+        preview = preview_bytes.decode("utf-8", "ignore")
         replay_problem = classify_replay_content(preview, str(response["final_url"]))
         if replay_problem or "wayback machine" in preview.casefold() or "not archived" in preview.casefold():
             temp.unlink(missing_ok=True)
             raise RuntimeError(replay_problem or "invalid_wayback_replay")
+        temp.unlink(missing_ok=True)
+        raise RuntimeError("non_media_response: replay returned an HTML page, not the requested image/video")
     os.replace(temp, path)
     return {
         "id": int(row["id"]),

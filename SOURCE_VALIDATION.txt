@@ -1,63 +1,39 @@
-Archive Scout 1.0.7 source validation
-Date: 2026-09-17
+Archive Scout 1.0.7.1 source validation
+Date: 2026-09-18
+Baseline: uploaded archive-scout-main(2).zip, commit 405f5eebdb4fbb165c9a5c718549848065cc80a6
 
-Release scope
-- Preserves the v1.0.5-style high-throughput acquisition envelope already restored in the 1.0.6.x line: ten CDX workers, native Timemap paging, 0.75-second CDX spacing, ten replay workers, and 0.125-second replay request spacing by default.
-- Moves expensive startup preparation off the Tk/UI thread so Start creates a worker immediately instead of remaining indefinitely at "Starting..." while bundle/database preparation blocks the interface.
-- Extends optional follow-up media acquisition to Index and download only (no scanning) runs while preserving the lean acquisition-only database model.
-- Keeps primary text/index CDX settings independent from secondary media indexing. Default/earliest follow-up media uses collapse=urlkey (one timestamp per normalized media URL); explicit media latest/all choices remain media-only overrides.
-- Adds a comprehensive Reports matrix: each standard text/index/error/media/archive-analysis report can be enabled or disabled, and every field/section in those reports can be individually included or excluded.
-- Avoids computing and persisting report-only scan enrichment when no enabled report needs it. Existing obsolete hit-detail, snippet, interesting-link, and untouched default-review payloads are cleared once when the report-storage policy changes.
-- Database schema remains version 8. No destructive project migration is introduced.
+Executed on Linux / Python 3.12
+- Complete unittest discovery: 266 tests run, 265 passed, 1 skipped, 0 failures/errors.
+- The skipped test needs a graphical display (test_v3_ui_theme).
+- Python compilation: archive_scout, tests and scripts passed.
+- git diff --check passed.
+- 100,000-CDX-row offline benchmark completed; 100,000 inserts, zero duplicate work and zero writes on unchanged re-upsert.
 
-Report customization and SQLite behavior
-- Report output and field selections persist in project.json through ReportConfig.
-- Disabling a report removes stale generated copies rather than leaving an old report that no longer reflects project settings.
-- Keyword hit-count JSON is persisted only when keyword counts or ranked keyword-hit output requires it.
-- Keyword field-detail JSON is persisted only when ranked keyword-hit detail requires it.
-- Snippet JSON is persisted only when ranked snippets are enabled.
-- Interesting-link JSON is persisted only when the standalone Interesting Links report or ranked Interesting Links section is enabled.
-- Untouched default "unreviewed" review rows are not created when ranked review status is disabled; genuine human review state is preserved.
-- A report-storage policy fingerprint in project_meta prevents repeated whole-table cleanup work on every report generation.
-- Core project state is intentionally not treated as report-only data: capture URLs/timestamps, queue states, local paths, retry/error state, scores/linkage required by active operations, and other resume/integrity records remain available even if corresponding report fields are hidden.
-- SQLite may retain free pages after old report-only values are nulled/deleted until Compact Project/VACUUM reclaims them physically; the disabled payloads are no longer live data and new rows do not recreate them.
+Network validation is offline/local
+- Real local HTTP server tests cover valid ranges, ignored ranges, mismatched offsets and rejected ranges through httpx, urllib3 and curl.
+- Mocked regressions cover proxy/environment policy, backend initialization failures, preserved partial bytes and bounded page submission.
+- CDX tests reject incomplete JSON rows and preserve literal nested URL/resume-key characters after a query round trip.
+- Input tests cover normal URLs, wholly encoded/double-encoded URLs and copied CDX request URLs.
 
-Download-only media behavior
-- The download-only path still performs no keyword/document scan and does not create fake scan jobs merely to enable media acquisition.
-- When media is enabled, download-only can index/download images and videos after its normal capture acquisition.
-- Applicable Media-page settings carry through, including image/video selection, embedded discovery, external-host permission, extension filters, maximum media size, and media snapshot strategy.
-- Embedded-media discovery can inspect downloaded_unscanned capture files directly and queue discovered media with a nullable source_document_id, leaving the documents table untouched.
-- Existing durable media discovery/download tables continue to provide resume and deduplication state without a schema change.
+Other focused regressions
+- Report controls persist, Reports is visible in Simple mode in the requested position, and output changes preserve historical scan data.
+- Report match ordering/limits are consistent across ranked output and URL reports.
+- Raw text .txt files retain legacy header encodings; binary signatures override incorrect text MIME.
+- Hitlist interruption cannot advance past uncommitted results; binary bodies do not count as checked text.
+- Worker startup failure restores controls; full-run rate-limit pauses preserve their original exception.
+- Failing local scans remain retryable rather than looping indefinitely.
+- Existing capture paths and portable filename collisions preserve separate captures.
+- Unsupported newer project schemas are not migrated as legacy files.
 
-Text/media CDX isolation
-- The primary text/index ProjectConfig is never mutated merely because follow-up media is enabled.
-- Default/earliest secondary media indexing derives a separate config with collapse=urlkey.
-- Explicit media latest/all strategies do not impose the automatic urlkey collapse on that media query.
-- Dedicated text collapse choices continue to apply only to the primary text/index query.
+Commands (after installing requirements-runtime.txt)
+python -m unittest discover -s tests -p 'test_*.py'
+python -m compileall -q archive_scout tests scripts
+python scripts/benchmark_offline.py --cdx-rows 100000 --result-rows 1000 --keyword-score-runs 20 --output benchmark.json
 
-Startup behavior
-- GUI Start performs lightweight form/config validation, enters indeterminate Starting state, and creates the worker before frozen-bundle validation or operation/database initialization.
-- Bundle validation and subsequent heavyweight operation preparation run inside the worker and surface success/failure through the normal event path.
-- The pre-worker synchronous dashboard recount was removed from Start.
+Test process proxy variables were cleared so local-server fixtures did not use this environment's outbound proxy. Dedicated proxy-policy tests use controlled environment fixtures.
 
-Automation compatibility
-- Existing CLI text/JSON/JSONL automation interfaces remain the bot/integration contract.
-- No Discord-specific runtime dependency, Rich Presence loop, or acquisition-hot-path bot activity was added for 1.0.7.
-- Read-only automation commands retain query-only database behavior.
-
-Regression coverage added for 1.0.7
-- Secondary media collapse is isolated from the primary text query.
-- Comprehensive report matrices round-trip through project.json, including intentionally empty field selections.
-- Disabled snippets, interesting-link filtering, keyword-detail payloads, and default review rows are not computed/stored when not required.
-- Changing an existing project to a lean report policy clears obsolete report-only payloads once and then reuses the saved policy fingerprint.
-- Download-only executes the optional media pipeline without creating scan jobs and preserves external-media settings.
-- Embedded-media discovery works directly from downloaded_unscanned capture files without creating documents.
-- Start creates the worker before slow bundle/dashboard initialization.
-- The high-throughput default profile remains ten replay workers, ten CDX workers, 0.75-second CDX spacing, and 0.125-second replay spacing.
-
-Local automated validation
-- Full unit/integration/migration suite: 240 tests run, 237 passed, 3 environment-dependent skips, 0 failed.
-- Python compileall passes for archive_scout, tests, and scripts.
-- Offline 100,000-row benchmark completed with 100,000 inserts, 4 database transactions, zero duplicate work, zero HTTP attempts, and zero unchanged-row rewrites.
-- Database schema remains 8.
-- Native multi-platform GitHub Actions/build smoke tests must still run on the exact release commit before publishing platform binaries.
+Limits
+- No live Wayback availability/throughput test was performed. Eight request starts/second remains the configured replay ceiling, not a guaranteed completion rate.
+- No native Windows/macOS packaged builds or interactive GUI display check was run here. Use the existing CI/build matrix and packaged smoke tests before release.
+- The friend's exact failing CDX request was not supplied, so its specific cause is unconfirmed.
+- Source patch only: no release/tag published and no credentials or downloaded project data included.

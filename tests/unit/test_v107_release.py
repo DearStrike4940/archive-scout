@@ -112,6 +112,7 @@ class V107ReleaseTests(unittest.TestCase):
 
     def test_disabled_report_details_are_not_computed_or_stored(self):
         report = ReportConfig(
+            retain_scan_details=False,
             outputs=["matches_ranked"],
             fields={
                 name: (["score", "original_url"] if name == "matches_ranked" else [])
@@ -188,7 +189,7 @@ class V107ReleaseTests(unittest.TestCase):
             finally:
                 database.close()
 
-    def test_report_storage_policy_clears_obsolete_payloads_once(self):
+    def test_report_storage_policy_preserves_historical_payloads(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             database = open_database(root)
@@ -230,6 +231,7 @@ class V107ReleaseTests(unittest.TestCase):
                 self.assertEqual(database.execute("SELECT COUNT(*) FROM reviews").fetchone()[0], 1)
 
                 lean_report = ReportConfig(
+                    retain_scan_details=False,
                     outputs=["matches_ranked"],
                     fields={
                         name: (["score", "original_url"] if name == "matches_ranked" else [])
@@ -237,20 +239,19 @@ class V107ReleaseTests(unittest.TestCase):
                     },
                 ).normalized()
                 changed = apply_report_storage_policy(database, lean_report)
-                self.assertGreater(changed, 0)
+                self.assertEqual(changed, 0)
                 after = database.execute(
                     "SELECT hits_json,fields_json,snippets_json,interesting_links_json FROM document_matches"
                 ).fetchone()
-                self.assertTrue(all(after[name] is None for name in after.keys()))
-                self.assertEqual(database.execute("SELECT COUNT(*) FROM reviews").fetchone()[0], 0)
+                self.assertEqual(tuple(before), tuple(after))
+                self.assertEqual(database.execute("SELECT COUNT(*) FROM reviews").fetchone()[0], 1)
 
-                # The stored policy fingerprint makes subsequent report generation
-                # O(1) instead of rescanning document_matches every time.
+                # Rendering preferences never trigger project-wide cleanup.
                 self.assertEqual(apply_report_storage_policy(database, lean_report), 0)
                 fingerprint = database.execute(
                     "SELECT value FROM project_meta WHERE key='report_storage_policy_v1'"
                 ).fetchone()
-                self.assertIsNotNone(fingerprint)
+                self.assertIsNone(fingerprint)
             finally:
                 database.close()
 

@@ -1,6 +1,6 @@
-ARCHIVE SCOUT 1.0.7 RELEASE CHECKLIST
+ARCHIVE SCOUT 1.0.7.1 RELEASE CHECKLIST
 
-1. Confirm pyproject.toml and archive_scout/constants.py both report 1.0.7.
+1. Confirm pyproject.toml, archive_scout/constants.py and platform metadata report 1.0.7.1.
 2. Confirm schema version is 8 and migration tests pass from supported older schemas.
 3. Run the complete Tests workflow on Linux, Windows, Intel macOS, and Apple Silicon macOS for Python 3.11 and 3.12.
 4. Confirm the offline benchmark smoke test passes without Internet Archive network access.
@@ -13,5 +13,5 @@ ARCHIVE SCOUT 1.0.7 RELEASE CHECKLIST
 11. Confirm the packaged macOS application passes its frozen-runtime and startup probes.
 12. Confirm tagged Windows release packaging is signed and the signature verifies.
 13. Verify all release checksums.
-14. Create the v1.0.7 tag only from the validated release commit.
+14. Create the v1.0.7.1 tag only from the validated release commit.
 15. Publish release assets only after all native builds and smoke tests succeed.

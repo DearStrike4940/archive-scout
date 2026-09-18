@@ -196,7 +196,7 @@ class FastIndexingTests(unittest.TestCase):
             self.assertEqual(database.execute("SELECT complete FROM index_state").fetchone()[0], 1)
             database.close()
 
-    def test_timemap_page_count_gets_five_native_json_attempts(self):
+    def test_timed_out_page_count_does_not_multiply_long_waits(self):
         class CountClient:
             retry_callback = None
 
@@ -220,7 +220,7 @@ class FastIndexingTests(unittest.TestCase):
                 config,
                 threading.Event(),
             )
-        self.assertEqual(client.calls, 5)
+        self.assertEqual(client.calls, 1)
 
     def test_paged_index_emits_live_page_progress(self):
         with tempfile.TemporaryDirectory() as temp:

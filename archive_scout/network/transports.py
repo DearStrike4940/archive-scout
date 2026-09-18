@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -30,6 +32,10 @@ class BackendUnavailable(RuntimeError):
     pass
 
 
+class InvalidRangeResponse(RuntimeError):
+    """Replay cannot safely be appended; retry the complete representation."""
+
+
 class TransportExhaustedError(RuntimeError):
     def __init__(self, url: str, failures: list[tuple[str, BaseException]]) -> None:
         self.url = url
@@ -40,6 +46,7 @@ class TransportExhaustedError(RuntimeError):
             is_transport_connection_failure(exc) for _, exc in failures
         )
         summary = "; ".join(f"{name}: {type(exc).__name__}: {exc}" for name, exc in failures)
+        summary = re.sub(r"([a-zA-Z][\w+.-]*://)[^/\s@]+@", r"\1[redacted]@", summary)
         super().__init__(f"all network backends failed for {url}: {summary}")
 
 
@@ -147,8 +154,35 @@ def is_transport_read_timeout(exc: BaseException) -> bool:
         current = current.__cause__ or current.__context__
     return False
 
-def _ssl_context() -> ssl.SSLContext:
-    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT) if truststore else ssl.create_default_context()
+def _ssl_context(trust_env: bool = True) -> ssl.SSLContext:
+    context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT) if truststore else ssl.create_default_context()
+    if trust_env:
+        cafile, capath = os.environ.get("SSL_CERT_FILE"), os.environ.get("SSL_CERT_DIR")
+        if cafile or capath:
+            context.load_verify_locations(cafile=cafile, capath=capath)
+    return context
+
+
+def _validate_range(status: int, response_headers, request_headers, existing_size: int) -> bool:
+    if status != 206:
+        return False  # A full 200 replaces, never appends to, the saved prefix.
+    fields = {str(k).lower(): str(v) for k, v in response_headers.items()}
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", fields.get("content-range", "").strip())
+    requested = request_headers.get("Range", "")
+    if (not match or requested != f"bytes={existing_size}-" or existing_size <= 0
+            or fields.get("content-encoding", "identity").lower() not in {"", "identity"}):
+        raise InvalidRangeResponse("invalid replay range response; restarting complete file")
+    start, end, total = map(int, match.groups())
+    if start != existing_size or end < start or end + 1 != total:
+        raise InvalidRangeResponse("mismatched replay range offsets; restarting complete file")
+    return True
+
+
+def _validate_range_size(status: int, headers, total: int) -> None:
+    if status == 206:
+        fields = {str(k).lower(): str(v) for k, v in headers.items()}
+        if total != int(fields["content-range"].rsplit("/", 1)[1]):
+            raise InvalidRangeResponse("incomplete replay range body; restarting complete file")
 
 
 def _read_limited(chunks: Iterable[bytes], max_bytes: int, stop_event: threading.Event) -> bytearray:
@@ -243,7 +277,7 @@ class HttpxBackend:
         self.connect_timeout = max(1.0, float(connect_timeout))
         self.read_timeout = max(1.0, float(read_timeout))
         self.client = httpx.Client(
-            verify=_ssl_context(),
+            verify=_ssl_context(trust_env),
             follow_redirects=True,
             max_redirects=10,
             trust_env=bool(trust_env),
@@ -303,11 +337,13 @@ class HttpxBackend:
             announced = response.headers.get("Content-Length")
             if announced and announced.isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-            append = int(response.status_code) == 206 and bool(headers.get("Range")) and destination.exists()
+            append = _validate_range(int(response.status_code), response.headers, headers,
+                                     destination.stat().st_size if destination.exists() else 0)
             total, content_hash, preview = _write_limited(
                 response.iter_bytes(1024 * 1024), destination, max_bytes, stop_event,
                 append=append, compute_hash=compute_hash,
             )
+            _validate_range_size(int(response.status_code), response.headers, total)
             return TransportFileResponse(
                 status=int(response.status_code),
                 headers=_copy_headers(response.headers.items()),
@@ -324,25 +360,54 @@ class HttpxBackend:
 class Urllib3Backend:
     name = "urllib3"
 
-    def __init__(self, pool_size: int, connect_timeout: float, read_timeout: float) -> None:
+    def __init__(self, pool_size: int, connect_timeout: float, read_timeout: float, trust_env: bool = True) -> None:
         self.timeout = urllib3.Timeout(connect=max(1.0, connect_timeout), read=max(1.0, read_timeout))
-        self.pool = urllib3.PoolManager(
+        self.pool_options = dict(
             num_pools=4,
             maxsize=max(2, int(pool_size)),
             block=True,
-            ssl_context=_ssl_context(),
+            ssl_context=_ssl_context(trust_env),
             retries=False,
         )
+        self.pool = urllib3.PoolManager(**self.pool_options)
+        self.proxies = urllib.request.getproxies() if trust_env else {}
+        self.proxy_pools: dict[str, object] = {}
+        self.proxy_lock = threading.Lock()
+
+    def _pool_for(self, url: str):
+        parsed = urllib.parse.urlsplit(url)
+        if not self.proxies or urllib.request.proxy_bypass_environment(parsed.netloc, self.proxies):
+            return self.pool
+        proxy = self.proxies.get(parsed.scheme) or self.proxies.get("all")
+        if not proxy:
+            return self.pool
+        with self.proxy_lock:
+            if proxy not in self.proxy_pools:
+                parsed_proxy = urllib.parse.urlsplit(proxy)
+                if parsed_proxy.scheme not in {"http", "https"}:
+                    raise BackendUnavailable("urllib3 requires an HTTP(S) proxy; use httpx or curl for this proxy type")
+                credentials = None
+                if parsed_proxy.username is not None:
+                    credentials = urllib3.make_headers(proxy_basic_auth=(
+                        urllib.parse.unquote(parsed_proxy.username) + ":" + urllib.parse.unquote(parsed_proxy.password or "")
+                    ))
+                proxy_address = urllib.parse.urlunsplit(parsed_proxy._replace(netloc=parsed_proxy.netloc.rsplit("@", 1)[-1]))
+                self.proxy_pools[proxy] = urllib3.ProxyManager(proxy_address, proxy_headers=credentials, **self.pool_options)
+            return self.proxy_pools[proxy]
 
     def close(self) -> None:
         self.pool.clear()
+        for pool in self.proxy_pools.values():
+            pool.clear()
 
     @staticmethod
     def _discard(response) -> None:
         if response is None:
             return
         try:
-            response.drain_conn()
+            # Do not drain an unbounded/stalled body after cancellation, a size
+            # rejection or a read failure. Close then return the pool slot.
+            response.close()
             response.release_conn()
         except Exception:
             try:
@@ -363,7 +428,7 @@ class Urllib3Backend:
         response = None
         try:
             for _ in range(11):
-                response = self.pool.request(
+                response = self._pool_for(current_url).request(
                     "GET",
                     current_url,
                     headers=headers,
@@ -396,7 +461,7 @@ class Urllib3Backend:
                 backend=self.name,
                 elapsed=time.monotonic() - started,
             )
-            self._discard(response)
+            response.release_conn()
             response = None
             return result
         finally:
@@ -419,7 +484,7 @@ class Urllib3Backend:
         response = None
         try:
             for _ in range(11):
-                response = self.pool.request(
+                response = self._pool_for(current_url).request(
                     "GET", current_url, headers=headers, preload_content=False,
                     redirect=False, retries=False, timeout=self.timeout,
                 )
@@ -437,11 +502,13 @@ class Urllib3Backend:
             announced = response.headers.get("Content-Length")
             if announced and str(announced).isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-            append = int(response.status) == 206 and bool(headers.get("Range")) and destination.exists()
+            append = _validate_range(int(response.status), response.headers, headers,
+                                     destination.stat().st_size if destination.exists() else 0)
             total, content_hash, preview = _write_limited(
                 response.stream(amt=1024 * 1024, decode_content=True),
                 destination, max_bytes, stop_event, append=append, compute_hash=compute_hash,
             )
+            _validate_range_size(int(response.status), response.headers, total)
             result = TransportFileResponse(
                 status=int(response.status),
                 headers=_copy_headers(response.headers.items()),
@@ -453,7 +520,7 @@ class Urllib3Backend:
                 backend=self.name,
                 elapsed=time.monotonic() - started,
             )
-            self._discard(response)
+            response.release_conn()
             response = None
             return result
         finally:
@@ -464,13 +531,20 @@ class Urllib3Backend:
 class CurlBackend:
     name = "curl"
 
-    def __init__(self, connect_timeout: float, read_timeout: float) -> None:
+    def __init__(self, connect_timeout: float, read_timeout: float, trust_env: bool = True) -> None:
         executable = shutil.which("curl")
         if not executable:
             raise BackendUnavailable("curl executable was not found")
         self.executable = executable
         self.connect_timeout = max(1.0, float(connect_timeout))
         self.read_timeout = max(1.0, float(read_timeout))
+        self.trust_env = bool(trust_env)
+
+    def _environment(self) -> dict[str, str]:
+        # Apply the same user-selected environment policy to all backends.
+        excluded = {"http_proxy", "https_proxy", "all_proxy", "no_proxy", "ssl_cert_file", "ssl_cert_dir", "curl_ca_bundle"}
+        return {key: value for key, value in os.environ.items()
+                if self.trust_env or key.lower() not in excluded}
 
     def close(self) -> None:
         return
@@ -504,6 +578,7 @@ class CurlBackend:
             body_path = Path(temp_dir) / "body.bin"
             command = [
                 self.executable,
+                "--disable",  # Ignore .curlrc, which can silently override app policy.
                 "--location",
                 "--compressed",
                 "--http1.1",
@@ -532,6 +607,7 @@ class CurlBackend:
                 stderr=subprocess.PIPE,
                 text=True,
                 creationflags=creationflags,
+                env=self._environment(),
             )
             while proc.poll() is None:
                 if stop_event.wait(0.2):
@@ -579,7 +655,7 @@ class CurlBackend:
         with tempfile.TemporaryDirectory(prefix="archive-scout-curl-") as temp_dir:
             header_path = Path(temp_dir) / "headers.txt"
             command = [
-                self.executable, "--location", "--compressed", "--http1.1",
+                self.executable, "--disable", "--location", "--compressed", "--http1.1",
                 "--silent", "--show-error", "--connect-timeout", str(int(self.connect_timeout)),
                 "--max-time", str(int(self.connect_timeout + self.read_timeout)),
                 "--max-filesize", str(int(max_bytes)), "--dump-header", str(header_path),
@@ -594,6 +670,7 @@ class CurlBackend:
             proc = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 creationflags=creationflags,
+                env=self._environment(),
             )
             while proc.poll() is None:
                 if stop_event.wait(0.2):
@@ -609,6 +686,8 @@ class CurlBackend:
                 # not useful resume state.
                 if destination.exists() and destination.stat().st_size == 0:
                     destination.unlink(missing_ok=True)
+                if proc.returncode == 33:
+                    raise InvalidRangeResponse("server refused curl resume; restarting complete file")
                 if proc.returncode == 28:
                     raise TimeoutError(message)
                 raise OSError(message)
@@ -632,8 +711,12 @@ class CurlBackend:
             status = int(lines[-2]) if len(lines) >= 2 and lines[-2].isdigit() else 0
             final_url = lines[-1] if lines else url
             raw_headers = header_path.read_text(encoding="iso-8859-1", errors="replace") if header_path.exists() else ""
+            parsed_headers = self._parse_headers(raw_headers)
+            requested_start = int(headers.get("Range", "bytes=0-")[6:-1])
+            _validate_range(status, parsed_headers, headers, requested_start)
+            _validate_range_size(status, parsed_headers, size)
             return TransportFileResponse(
-                status=status, headers=self._parse_headers(raw_headers), final_url=final_url,
+                status=status, headers=parsed_headers, final_url=final_url,
                 path=destination, bytes_written=size,
                 content_hash=digest.hexdigest() if digest is not None else "",
                 preview=bytes(preview), backend=self.name, elapsed=time.monotonic() - started,
@@ -667,25 +750,26 @@ class ResilientTransport:
         self.lock = threading.Lock()
         self.cooldown_until: dict[str, float] = {}
         self.last_success: str | None = None
-        available: dict[str, object] = {
-            "httpx": HttpxBackend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
-            "urllib3": Urllib3Backend(pool_size, connect_timeout, read_timeout),
+        factories = {
+            "httpx": lambda: HttpxBackend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
+            "urllib3": lambda: Urllib3Backend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
+            "curl": lambda: CurlBackend(connect_timeout, read_timeout, trust_env=trust_env),
         }
-        try:
-            available["curl"] = CurlBackend(connect_timeout, read_timeout)
-        except BackendUnavailable:
-            pass
-        if requested == "auto":
-            self.backends = available
-            self.order = [name for name in ("httpx", "urllib3", "curl") if name in available]
-        else:
-            if requested not in available:
-                raise BackendUnavailable(f"requested network backend is unavailable: {requested}")
-            self.backends = {requested: available[requested]}
-            self.order = [requested]
-            for name, backend in available.items():
-                if name != requested:
-                    backend.close()
+        self.backends: dict[str, object] = {}
+        # A broken optional backend must not prevent the selected one starting.
+        # In auto mode an unavailable SOCKS extra, for example, need not prevent
+        # curl from using the user's configured SOCKS proxy.
+        for name in factories if requested == "auto" else (requested,):
+            try:
+                self.backends[name] = factories[name]()
+            except Exception as exc:
+                if requested != "auto":
+                    raise BackendUnavailable(f"{name} initialization failed ({type(exc).__name__}); check network settings") from exc
+                if callback:
+                    callback(f"Network backend {name} unavailable ({type(exc).__name__}); checking remaining backends")
+        self.order = list(self.backends)
+        if not self.backends:
+            raise BackendUnavailable("No network backend could start; check proxy and certificate settings")
 
     @property
     def backend_names(self) -> tuple[str, ...]:
@@ -735,7 +819,7 @@ class ResilientTransport:
             except RuntimeError as exc:
                 # Size limits and other deterministic local validation failures
                 # must not be retried using another backend.
-                if str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
+                if isinstance(exc, InvalidRangeResponse) or str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
                     raise
                 failures.append((name, exc))
             except Exception as exc:
@@ -783,14 +867,16 @@ class ResilientTransport:
             except Stopped:
                 raise
             except RuntimeError as exc:
-                if str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
+                if isinstance(exc, InvalidRangeResponse) or str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
                     raise
                 failures.append((name, exc))
             except Exception as exc:
                 failures.append((name, exc))
-            # Failed backends may have written corrupt/non-resumable bytes. Only
-            # a user stop is retained; transport failures restart cleanly.
-            destination.unlink(missing_ok=True)
+            # A failure can extend a valid .part prefix. Never send the stale
+            # Range header to another backend: the client must calculate the
+            # new offset for its next bounded retry.
+            if destination.exists() and destination.stat().st_size:
+                break
             with self.lock:
                 self.cooldown_until[name] = time.monotonic() + 30.0
             last_error = failures[-1][1]

@@ -87,17 +87,20 @@ def _default_report_fields() -> dict[str, list[str]]:
 
 @dataclass(slots=True)
 class ReportConfig:
-    """Controls every generated report and every field written to it.
+    """Presentation controls; never delete historical evidence or review state.
 
-    Core manifest/operation data is intentionally independent of reporting: URL,
-    timestamp, queue state, retry/error state, and local-path information must
-    remain available for resume, retry, Hitlist, and project integrity. Optional
-    derived scan detail that exists only to enrich reports is not persisted when
-    no enabled report field needs it.
+    Optional lean storage affects only enrichment of future scans. Acquisition
+    and Hitlist do not create these scan payloads in either mode.
     """
 
     outputs: list[str] = field(default_factory=lambda: list(REPORT_OUTPUT_NAMES))
     fields: dict[str, list[str]] = field(default_factory=_default_report_fields)
+    retain_scan_details: bool = True
+    sort_order: str = "score"
+    max_matches: int = 0
+    snippet_limit: int = 0
+    snippet_chars: int = 0
+    link_limit: int = 0
 
     def normalized(self) -> "ReportConfig":
         source = self.fields if isinstance(self.fields, dict) else {}
@@ -107,6 +110,12 @@ class ReportConfig:
                 name: _ordered_enabled(list(source.get(name, REPORT_FIELD_NAMES[name])), REPORT_FIELD_NAMES[name])
                 for name in REPORT_OUTPUT_NAMES
             },
+            retain_scan_details=bool(self.retain_scan_details),
+            sort_order=self.sort_order if self.sort_order in {"score", "oldest", "newest", "url"} else "score",
+            max_matches=max(0, int(self.max_matches)),
+            snippet_limit=max(0, int(self.snippet_limit)),
+            snippet_chars=max(0, int(self.snippet_chars)),
+            link_limit=max(0, int(self.link_limit)),
         )
 
     def output_enabled(self, name: str) -> bool:
@@ -132,7 +141,7 @@ class ReportConfig:
 
     @property
     def store_keyword_counts(self) -> bool:
-        return (
+        return self.retain_scan_details or (
             self.output_enabled("keyword_counts") and bool(self.fields_for("keyword_counts"))
         ) or (
             self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "keyword_hits")
@@ -140,7 +149,7 @@ class ReportConfig:
 
     @property
     def store_keyword_fields(self) -> bool:
-        return self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "keyword_hits")
+        return self.retain_scan_details or (self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "keyword_hits"))
 
     @property
     def store_keyword_details(self) -> bool:
@@ -148,17 +157,17 @@ class ReportConfig:
 
     @property
     def store_snippets(self) -> bool:
-        return self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "snippets")
+        return self.retain_scan_details or (self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "snippets"))
 
     @property
     def store_interesting_links(self) -> bool:
         standalone = self.output_enabled("interesting_links") and bool(self.fields_for("interesting_links"))
         ranked = self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "interesting_links")
-        return standalone or ranked
+        return self.retain_scan_details or standalone or ranked
 
     @property
     def create_default_reviews(self) -> bool:
-        return self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "review_status")
+        return self.retain_scan_details or (self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "review_status"))
 
     def to_payload(self) -> dict:
         return asdict(self.normalized())
@@ -651,7 +660,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     # in flight using the historical pageSize=9 grouping. Upgrade only the
     # untouched v1.0.4 automatic indexing profile.
     if (
-        saved_version not in {"1.0.6.2", "1.0.6.3", "1.0.6.4", "1.0.6.5", "1.0.6.6", "1.0.7"}
+        saved_version not in {"1.0.6.2", "1.0.6.3", "1.0.6.4", "1.0.6.5", "1.0.6.6", "1.0.7", "1.0.7.1"}
         and loaded_page_size == 100000
         and loaded_cdx_delay == 0.75
         and loaded_page_blocks == 0
@@ -715,6 +724,12 @@ def load_project_config(path: Path) -> ProjectConfig:
         download_scope=str(payload.get("download_scope", "all_text")),
         minimum_score=int(payload.get("minimum_score", 1)),
         report=ReportConfig(
+            retain_scan_details=bool(report_payload.get("retain_scan_details", True)),
+            sort_order=str(report_payload.get("sort_order", "score")),
+            max_matches=int(report_payload.get("max_matches", 0)),
+            snippet_limit=int(report_payload.get("snippet_limit", 0)),
+            snippet_chars=int(report_payload.get("snippet_chars", 0)),
+            link_limit=int(report_payload.get("link_limit", 0)),
             outputs=list(report_payload["outputs"]) if "outputs" in report_payload else list(REPORT_OUTPUT_NAMES),
             fields={
                 name: (
