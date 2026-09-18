@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 import threading
@@ -185,6 +186,19 @@ class V107ReleaseTests(unittest.TestCase):
                 self.assertNotIn("INTERESTING LINKS:", ranked)
                 self.assertFalse((root / "reports" / "interesting_links.txt").exists())
                 self.assertFalse((root / "reports" / "keyword_counts.txt").exists())
+                with paths["all_matches_csv"].open(encoding="utf-8", newline="") as handle:
+                    csv_report = csv.DictReader(handle)
+                    self.assertEqual(csv_report.fieldnames, ["score", "original_url"])
+                    self.assertEqual(len(list(csv_report)), 1)
+                markdown = paths["all_matches_markdown"].read_text(encoding="utf-8")
+                self.assertIn("**Score:**", markdown)
+                self.assertNotIn("### Snippets", markdown)
+                self.assertNotIn("**Keyword hits:**", markdown)
+                config.report.outputs = []
+                disabled = generate_reports(config, database, scan_run)
+                self.assertNotIn("all_matches_markdown", disabled)
+                for suffix in ("md", "csv", "txt"):
+                    self.assertFalse((root / "reports" / f"all_matches_ranked.{suffix}").exists())
             finally:
                 database.close()
 

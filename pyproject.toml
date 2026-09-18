@@ -23,9 +23,11 @@ classifiers = [
 
 [project.optional-dependencies]
 research = ["fastembed>=0.7,<1"]
+discord = ["discord.py>=2.7,<3"]
 
 [project.scripts]
 archive-scout = "archive_scout.cli:main"
+archive-scout-discord = "archive_scout.discord_bot:main"
 
 [project.gui-scripts]
 archive-scout-gui = "archive_scout.app:main"

@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.venv
+__pycache__
+*.pyc
+*.sqlite3*
+data
+build
+dist
+release
+tests

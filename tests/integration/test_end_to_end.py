@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import tempfile
 import unittest
@@ -70,6 +71,19 @@ class EndToEndTests(unittest.TestCase):
             )
             second_paths = run_project(second, "rescan")
             self.assertIn("canopy", second_paths["matches_ranked"].read_text(encoding="utf-8").casefold())
+            all_matches = second_paths["all_matches_ranked"].read_text(encoding="utf-8")
+            self.assertIn("WTC", all_matches)
+            self.assertIn("canopy", all_matches.casefold())
+            self.assertIn("SCAN RUN: 1", all_matches)
+            self.assertIn("SCAN RUN: 2", all_matches)
+            markdown = second_paths["all_matches_markdown"].read_text(encoding="utf-8")
+            self.assertIn("# Archive Scout combined qualifying matches", markdown)
+            self.assertIn("## 1.", markdown)
+            with second_paths["all_matches_csv"].open(encoding="utf-8", newline="") as handle:
+                spreadsheet = list(csv.DictReader(handle))
+            self.assertEqual(len(spreadsheet), 2)
+            self.assertEqual({row["scan_run"] for row in spreadsheet}, {"1", "2"})
+            self.assertIn("original_url", spreadsheet[0])
             database = open_database(root)
             self.assertEqual(database.execute("SELECT COUNT(*) FROM scan_runs WHERE status='complete'").fetchone()[0], 2)
             self.assertEqual(database.execute("SELECT COUNT(*) FROM document_matches").fetchone()[0], 2)

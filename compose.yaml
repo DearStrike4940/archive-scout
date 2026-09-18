@@ -1,0 +1,19 @@
+services:
+  archive-scout-bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ARCHIVE_SCOUT_PROJECTS_ROOT: /data/projects
+    volumes:
+      - archive-scout-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  archive-scout-data:
